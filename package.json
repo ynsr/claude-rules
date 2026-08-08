@@ -1,0 +1,14 @@
+{
+  "name": "claude-rules",
+  "version": "0.1.0",
+  "description": "Inject Claude Code .claude/rules/*.md rules into omp/Pi based on paths frontmatter",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test"
+  },
+  "license": "MIT"
+}

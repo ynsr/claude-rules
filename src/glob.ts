@@ -14,11 +14,15 @@ export function globToRegExp(pattern: string): RegExp {
 
     if (c === "*") {
       if (pattern[i + 1] === "*") {
-        // `**` — match zero or more segments (including none).
-        out += "(?:.*/)?";
         i += 2;
-        // Skip an immediately-following single slash.
-        if (pattern[i] === "/") i++;
+        // `**/` — match zero or more leading segments; a trailing bare `**`
+        // matches everything remaining (including files).
+        if (pattern[i] === "/") {
+          out += "(?:.*/)?";
+          i++;
+        } else {
+          out += ".*";
+        }
       } else {
         out += "[^/]*";
         i++;

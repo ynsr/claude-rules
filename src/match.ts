@@ -21,13 +21,12 @@ export function matchRule(rule: Rule, touchedPaths: string[]): boolean {
   if (rule.alwaysApply) return true;
   if (rule.paths.length === 0) return false;
 
-  const positiveHit = touchedPaths.some((tp) =>
-    rule.paths.some((pattern) => matchGlob(pattern, tp))
-  );
-  if (!positiveHit) return false;
-
-  const negatedHit = touchedPaths.some((tp) =>
-    rule.negated.some((pattern) => matchGlob(pattern, tp))
-  );
-  return !negatedHit;
+  return touchedPaths.some((tp) => {
+    const positiveHit = rule.paths.some((pattern) => matchGlob(pattern, tp));
+    if (!positiveHit) return false;
+    // Per-path negation: a touched path contributing to a match must not
+    // itself be hidden by a negated glob. Other (negated) touched paths do
+    // not disqualify the rule — matching Claude Code's per-path semantics.
+    return !rule.negated.some((pattern) => matchGlob(pattern, tp));
+  });
 }

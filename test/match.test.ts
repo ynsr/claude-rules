@@ -55,6 +55,16 @@ describe("matchRule", () => {
     expect(matchRule(r, ["src/manual/x.ts"])).toBe(true);
   });
 
+  test("per-path negation: a distinct positive, unnegated path still matches", () => {
+    // src/manual/x.ts matches a positive glob and is not hidden by the
+    // negation, so the rule applies — even though src/generated/gen.ts is
+    // also touched and negated. (Global negation would return false here.)
+    const r = rule({ paths: ["src/**"], negated: ["src/generated/**"] });
+    expect(matchRule(r, ["src/generated/gen.ts", "src/manual/x.ts"])).toBe(true);
+    // Every positive-matched path hidden by a negation → no match.
+    expect(matchRule(r, ["src/generated/a.ts", "src/generated/b.ts"])).toBe(false);
+  });
+
   test("empty touchedPaths and non-always rule → false", () => {
     expect(matchRule(rule({ paths: ["src/**"] }), [])).toBe(false);
   });

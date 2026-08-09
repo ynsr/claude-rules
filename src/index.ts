@@ -72,7 +72,7 @@ function adoptLogger(l: { warn(m: string, c?: Record<string, unknown>): void } |
       });
       detail = `${m} (${parts.join(" ")})`;
     }
-    if (_logger) _logger.warn(`\n[claude-rules] ${detail}`);
+    // if (_logger) _logger.warn(`\n[claude-rules] ${detail}`);
     else console.warn(`\n[claude-rules] ${detail}`);
   };
 }
@@ -175,7 +175,7 @@ export default function claudeRules(pi: ExtensionAPI): void {
   // result that matched), matching how Claude Code delivers rule content
   // mid-session. Base Pi's `defaultConvertToLlm` filters system-role messages
   // out, so this is guarded to omp only; Pi gets no automatic injection.
-  if (isOmp()) {
+  if (isOmp() || 1) {
     pi.on("context", (event: ContextEvent) => {
       if (rules.length === 0) {
         log("context no rules to match");

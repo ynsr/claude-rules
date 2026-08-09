@@ -93,6 +93,45 @@ export function capturePath(
   return p;
 }
 
+// Prompt-referenced files are matched against rule paths even when no tool has
+// touched them. Two forms are recognized:
+//   1. `@path/to/file.ext` mentions in the user's prompt text.
+//   2. `<file path="...">` blocks — the shape omp uses to inject `@path` file
+//      content as a separate user message in the same request as the prompt.
+const AT_PATH_RE = /@([^\s@<>"'`]+)/g;
+const FILE_BLOCK_RE = /<file\s+path="([^"]+)"/g;
+
+/** Extract file paths referenced in a string via `@path` or `<file path="…">`. */
+export function extractPromptPaths(text: string): string[] {
+  const out: string[] = [];
+  for (const m of text.matchAll(AT_PATH_RE)) {
+    // Strip trailing punctuation that isn't part of a path (e.g. `file.java,`).
+    const p = m[1].replace(/[.,;:!?)\]}"']+$/, "");
+    // Only count a `@token` as a file reference if it plausibly looks like a
+    // path (separator, file extension, or ~/ home prefix) — avoids matching
+    // bare `@mentions`/email-ish tokens as touched paths.
+    if (p && (p.includes("/") || p.includes("\\") || /\.\w+$/.test(p) || p.startsWith("~"))) {
+      out.push(p);
+    }
+  }
+  for (const m of text.matchAll(FILE_BLOCK_RE)) out.push(m[1]);
+  return out;
+}
+
+/** Best-effort text of a message's content (string or text-content array). */
+function contentText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((c): c is { type: "text"; text: string } =>
+        !!c && typeof c === "object" && (c as { type?: string }).type === "text",
+      )
+      .map((c) => c.text)
+      .join("\n");
+  }
+  return "";
+}
+
 export default function claudeRules(pi: ExtensionAPI): void {
   let rules: Rule[] = [];
   let repoRoot = "";
@@ -163,6 +202,15 @@ export default function claudeRules(pi: ExtensionAPI): void {
   // the contextual-guidance note to the system prompt at the start of the turn.
   pi.on("before_agent_start", async (event) => {
     injectedThisTurn.clear();
+    // Files referenced in the prompt via `@path/to/file.ext` (or inline
+    // `<file path="…">` blocks) count as touched, so path-scoped rules match
+    // even before any tool_call reads the file. omp also injects the file
+    // content as a separate message — handled in the context handler below.
+    if (typeof event.prompt === "string") {
+      for (const raw of extractPromptPaths(event.prompt)) {
+        touched.add(normalizePath(raw, repoRoot));
+      }
+    }
     return {
       systemPrompt: event.systemPrompt + "\n\n" + CONTEXT_NOTE,
     };
@@ -177,6 +225,18 @@ export default function claudeRules(pi: ExtensionAPI): void {
   // out, so this is guarded to omp only; Pi gets no automatic injection.
   if (isOmp() || 1) {
     pi.on("context", (event: ContextEvent) => {
+      // omp expands `@path` prompt mentions into a separate user message whose
+      // content is a `<file path="…">` block. Capture those injected paths so
+      // the file matches path-scoped rules even though no tool_call touched it.
+      // scanned every step but `touched` is a Set, so this is idempotent.
+      for (const msg of event.messages) {
+        // AgentMessage is a union (incl. BashExecutionMessage with no
+        // `content`); narrow with `in` so the access is checked.
+        if (!msg || typeof msg !== "object" || !("content" in msg)) continue;
+        for (const raw of extractPromptPaths(contentText(msg.content))) {
+          touched.add(normalizePath(raw, repoRoot));
+        }
+      }
       if (rules.length === 0) {
         log("context no rules to match");
         return;

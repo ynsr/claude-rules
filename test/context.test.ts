@@ -196,6 +196,60 @@ describe("context-event mid-turn injection (omp)", () => {
     });
   });
 
+  test("matches a rule for a file referenced via `@path` in the prompt, without any tool_call", async () => {
+    await withOmp(true, async () => {
+      const repo = makeRepo();
+      const pi = makePi();
+      claudeRules(pi as unknown as ExtensionAPI);
+      await pi.emit("session_start", {}, { cwd: repo, hasUI: false, ui: {} });
+
+      // Prompt references the file via `@path`; no tool_call touches it.
+      const first = asHookResult(
+        await pi.emit("before_agent_start", {
+          systemPrompt: "BASE",
+          prompt: "summarize @src/security/SecurityConfig.java",
+        }),
+      );
+      expect(first?.systemPrompt).toContain("contextual");
+      expect(first?.systemPrompt).not.toContain("BE SECURE");
+
+      const ctx = asHookResult(
+        await pi.emit("context", { messages: [{ role: "user", content: "summarize @src/security/SecurityConfig.java" }] }),
+      );
+      const injected = ctx?.messages?.find(isInstructionsMessage);
+      expect(injected).toBeDefined();
+      if (injected) expect(injected.content).toContain("BE SECURE");
+    });
+  });
+
+  test("matches a rule when omp injects the file as a `<file path=...>` message", async () => {
+    await withOmp(true, async () => {
+      const repo = makeRepo();
+      const pi = makePi();
+      claudeRules(pi as unknown as ExtensionAPI);
+      await pi.emit("session_start", {}, { cwd: repo, hasUI: false, ui: {} });
+
+      await pi.emit("before_agent_start", { systemPrompt: "BASE", prompt: "summarize the file" });
+
+      // omp injects the file content as a separate user message with a
+      // `<file path="…">` block, in the same request as the prompt.
+      const ctx = asHookResult(
+        await pi.emit("context", {
+          messages: [
+            { role: "user", content: "summarize the file" },
+            {
+              role: "user",
+              content: '<file path="src/security/SecurityConfig.java">\n[SecurityConfig.java]\n1:package ir.jibit.projectx.config.security;\n</file>',
+            },
+          ],
+        }),
+      );
+      const injected = ctx?.messages?.filter(isInstructionsMessage);
+      expect(injected?.length).toBe(1);
+      if (injected?.[0]) expect(injected[0].content).toContain("BE SECURE");
+    });
+  });
+
   test("does not register the context handler when not omp (Pi fallback)", async () => {
     await withOmp(false, async () => {
       const repo = makeRepo();

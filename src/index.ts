@@ -26,17 +26,43 @@ function dedupKey(r: Rule): string {
 }
 
 // Contextual diagnostics. The structured logger (ctx.logger → ~/.omp/logs/omp.*.log)
-// is the reliable channel from the TUI-spawned session; plain console output
-// lands on the TUI's stdout and is not captured. We capture the logger at
-// session_start and route all subsequent diagnostics through it. The module-load
-// line (before any ctx) falls back to console.warn so loading is still visible.
+// is the reliable channel from the TUI-spawned session; plain console output lands
+// on the TUI's stdout and is not captured. We capture ctx at session_start and route
+// every diagnostic through BOTH the UI toast (ctx.ui.notify) and the structured
+// logger, so the event is visible live in the TUI and still tailable from the log
+// file. The module-load line (before any ctx) falls back to console.warn so loading
+// is still visible.
 let _logger: { warn(m: string, c?: Record<string, unknown>): void } | undefined;
+let _notify: ((m: string, t?: string) => void) | undefined;
 let log = (_m: string, _c?: Record<string, unknown>): void => {};
+function adoptUi(ctx: { hasUI?: boolean; ui?: { notify(m: string, t?: string): void } }): void {
+  if (ctx.hasUI && typeof ctx.ui?.notify === "function") {
+    _notify = (m, t) => ctx.ui!.notify(m, t ?? "info");
+  } else {
+    _notify = undefined;
+  }
+}
 function adoptLogger(l: { warn(m: string, c?: Record<string, unknown>): void } | undefined): void {
   _logger = l;
   log = (m, c) => {
+    // Compact, greppable single-line rendering of the context object.
+    let detail = m;
+    if (c) {
+      const parts = Object.entries(c).map(([k, v]) => {
+        const s = Array.isArray(v) ? v.join(",") : v && typeof v === "object" ? JSON.stringify(v) : String(v);
+        return `${k}=${s}`;
+      });
+      detail = `${m} (${parts.join(" ")})`;
+    }
+    if (_notify) {
+      try {
+        _notify(`[claude-rules] ${detail}`);
+      } catch {
+        /* toast failure must not break the handler */
+      }
+    }
     if (_logger) _logger.warn(`\n[claude-rules] ${m}`, c);
-    else console.warn(`\n[claude-rules] ${m}`, c ?? "");
+    else console.warn(`\n[claude-rules] ${detail}`);
   };
 }
 function loadLog(m: string): void {
@@ -76,17 +102,15 @@ export default function claudeRules(pi: ExtensionAPI): void {
     rules = await discoverRules(ctx.cwd);
     touched.clear();
     injectedThisTurn.clear();
-    // ctx.logger may be absent (e.g. pi mocks in tests); adoptLogger falls back to console.
+    // ctx.logger/ui may be absent (e.g. pi mocks in tests); adopters fall back to console.
     adoptLogger(ctx.logger);
+    adoptUi(ctx);
     log("session_start",{
       cwd: ctx.cwd,
       repoRoot,
       discovered: rules.length,
       rules: rules.map((r) => `${r.name}(${r.paths.length}p${r.negated.length}n${r.alwaysApply ? ",always" : ""})`).join(" "),
     });
-    if (rules.length > 0 && ctx.hasUI) {
-      ctx.ui.notify(`claude-rules: ${rules.length} rule(s) found`, "info");
-    }
   });
 
   pi.on("tool_call", async (event) => {

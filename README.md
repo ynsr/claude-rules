@@ -2,7 +2,9 @@
 
 Injects Claude Code `.claude/rules/*.md` rules into omp / Pi based on the `paths`
 frontmatter property. When the session touches a file matching a rule's `paths`,
-that rule's content is injected into the system prompt.
+that rule's content is injected into the system prompt (start of turn) and, as
+user-role `<instructions>` content alongside the tool result that matched
+(mid-session, like Claude Code).
 
 ## Why
 

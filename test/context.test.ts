@@ -69,8 +69,21 @@ function withOmp(marker: string | undefined, fn: () => Promise<void>): Promise<v
   });
 }
 
+// Type guard: a user-role message whose string content is an `<instructions>` block.
+function isInstructionsMessage(m: unknown): m is { role: "user"; content: string } {
+  return (
+    m !== null &&
+    typeof m === "object" &&
+    "role" in m &&
+    (m as { role: unknown }).role === "user" &&
+    "content" in m &&
+    typeof (m as { content: unknown }).content === "string" &&
+    (m as { content: string }).content.includes("<instructions>")
+  );
+}
+
 describe("context-event mid-turn injection (omp)", () => {
-  test("injects matching rule as a system message after a tool_call touches the file", async () => {
+  test("injects matching rule as a user `<instructions>` message after a tool_call touches the file", async () => {
     await withOmp("1", async () => {
       const repo = makeRepo();
       const pi = makePi();
@@ -94,15 +107,20 @@ describe("context-event mid-turn injection (omp)", () => {
         await pi.emit("context", { messages: [{ role: "user", content: "summarize" }] }),
       );
       expect(ctx1).not.toBeUndefined();
-      const sys = ctx1?.messages?.find((m) => m !== null && typeof m === "object" && "role" in m);
-      expect(sys).toBeDefined();
-      const sysMsg = sys as { role: string; content: string };
-      expect(sysMsg.content).toContain("# Security Rules");
-      expect(sysMsg.content).toContain("BE SECURE");
-      // prepended before the user message
-      expect(ctx1?.messages?.[0]).toBe(sys);
-      const firstMsg = ctx1?.messages?.[1] as { role: string };
-      expect(firstMsg.role).toBe("user");
+      const injected = ctx1?.messages?.find(isInstructionsMessage);
+      expect(injected).toBeDefined();
+      if (!injected) throw new Error("expected an injected <instructions> message");
+      expect(injected.content).toContain("# Security Rules");
+      expect(injected.content).toContain("BE SECURE");
+      expect(injected.content.startsWith("<instructions>")).toBe(true);
+      expect(injected.content.endsWith("</instructions>")).toBe(true);
+      // appended after the existing user message (alongside the tool result)
+      expect(ctx1?.messages?.[ctx1.messages!.length - 1]).toBe(injected);
+      const firstMsg = ctx1?.messages?.[0];
+      expect(firstMsg).not.toBeUndefined();
+      if (firstMsg && typeof firstMsg === "object" && "role" in firstMsg) {
+        expect(firstMsg.role).toBe("user");
+      }
     });
   });
 
@@ -120,9 +138,9 @@ describe("context-event mid-turn injection (omp)", () => {
       const ctx1 = asHookResult(
         await pi.emit("context", { messages: [{ role: "user", content: "a" }] }),
       );
-      expect(ctx1?.messages?.filter((m) => (m as { role?: string }).role === "system").length).toBe(1);
+      expect(ctx1?.messages?.filter(isInstructionsMessage).length).toBe(1);
 
-      // Same turn, another model step: rule already injected → no system message.
+      // Same turn, another model step: rule already injected → no instructions block.
       const ctx2 = await pi.emit("context", { messages: [{ role: "user", content: "b" }] });
       expect(ctx2).toBeUndefined();
     });
@@ -148,7 +166,7 @@ describe("context-event mid-turn injection (omp)", () => {
       expect(turn2?.systemPrompt).toContain("# Security Rules");
 
       // The rule is now in this turn's system prompt, so the context handler
-      // correctly skips it (dedup) — no duplicate system message this turn.
+      // correctly skips it (dedup) — no duplicate instructions block this turn.
       const ctx2 = await pi.emit("context", { messages: [{ role: "user", content: "b" }] });
       expect(ctx2).toBeUndefined();
     });

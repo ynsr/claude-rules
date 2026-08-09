@@ -153,17 +153,12 @@ export default function claudeRules(pi: ExtensionAPI): void {
         if (matched.length === 0) return;
         for (const r of matched) injectedThisTurn.add(dedupKey(r));
         return {
-            /**
-             * In mid-session below doesn't work. I checked the Claude Code Agent and it send the .claude/rules content in side a <instructions> tag as a user content alongside sending the next tool result. Claude Code will not wait until next turn (before_agent_start) to inject the rules. Example:
-             <instructions>
-             Contents of /home/bs/projects/jibit/cloud/projectx/.claude/rules/security.md:
-             ...
-             </instructions>
-             <instructions>
-             Contents of /home/bs/projects/jibit/cloud/projectx/.claude/rules/another-rule.md:
-             ...
-             </instructions>
-             */
+            // This hook only covers the START of a turn: `touched` holds paths
+            // from PRIOR turns, so a file first touched this turn can't be
+            // injected here. That gap is handled mid-session by the `context`
+            // handler below, which injects matching rules (as user-role
+            // `<instructions>` content, like Claude Code) right after the tool
+            // result that touched the path — it does not wait for the next turn.
             systemPrompt: event.systemPrompt + "\n\n" + formatRules(matched),
         };
     });
@@ -171,9 +166,12 @@ export default function claudeRules(pi: ExtensionAPI): void {
     // omp-only mid-turn injection. The `context` event fires before every model
     // step (agent-session transformContext → emitContext), so once a tool_call
     // has recorded a matching path, the SAME turn's next step receives the rule —
-    // fixing the one-turn-behind limitation of before_agent_start. Base Pi's
-    // `defaultConvertToLlm` filters system-role messages out, so this is guarded
-    // to omp only; Pi relies on before_agent_start.
+    // fixing the one-turn-behind limitation of before_agent_start. We inject as
+    // user-role `<instructions>` content (appended after the tool result that
+    // matched), matching how Claude Code delivers rule content mid-session,
+    // rather than a system message. Base Pi's `defaultConvertToLlm` filters
+    // system-role messages out, so this is guarded to omp only; Pi relies on
+    // before_agent_start.
     if (isOmp()) {
         pi.on("context", (event: ContextEvent) => {
             if (rules.length === 0) {
@@ -191,12 +189,16 @@ export default function claudeRules(pi: ExtensionAPI): void {
             });
             if (matched.length === 0) return;
             for (const r of matched) injectedThisTurn.add(dedupKey(r));
-            // AgentMessage isn't exported from the public API; the system role is
-            // omp-only and not part of the base Message union, so cast it.
+            // UserMessage isn't exported from the public API; the injected role
+            // is a user-role `<instructions>` block appended after the tool
+            // result so the model reads it as the current user instruction.
             return {
                 messages: [
-                    {role: "system", content: formatRules(matched)} as never,
                     ...event.messages,
+                    {
+                        role: "user",
+                        content: `<instructions>\n${formatRules(matched)}\n</instructions>`,
+                    } as never,
                 ],
             };
         });

@@ -19,7 +19,7 @@ test("integration: parse → match → format", () => {
   expect(matchRule(rule, touched)).toBe(true);
   const out = formatRules([rule]);
   expect(out).toContain("TS rules");
-  expect(out).toContain("## ts.md");
+  expect(out).toContain("Contents of /r/.claude/rules/ts.md:");
 });
 
 test("grep/find without a path arg does not capture the pattern as a touched path", () => {

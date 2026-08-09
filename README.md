@@ -12,17 +12,27 @@ rules to matching files. omp and Pi read `.claude/CLAUDE.md` but not
 
 ## Install
 
-Drop `src/index.ts` into your extension directory:
+The extension is split across modules (`src/discover.ts`, `match.ts`, `format.ts`,
+`rule.ts`, `glob.ts`). It cannot be installed by copying `src/index.ts` alone —
+its relative imports would fail to resolve outside the repo.
 
-- **omp:** `~/.omp/agent/extensions/claude-rules.ts`
-- **Pi:** `~/.pi/agent/extensions/claude-rules.ts`
-
-Or add it via `config.yml`:
+**Option A — reference the source path directly (recommended).** No copy needed;
+relative imports resolve within the repo. Via `config.yml`:
 
 ```yaml
 extensions:
   - /path/to/claude-rules/src/index.ts
 ```
+
+**Option B — bundle to a single self-contained file** for a drop-in copy:
+
+```bash
+bun build src/index.ts --target=bun --outfile=claude-rules.ts
+cp claude-rules.ts ~/.omp/agent/extensions/   # or ~/.pi/agent/extensions/
+```
+
+The bundle inlines the sibling modules, so `~/.omp/agent/extensions/claude-rules.ts`
+loads on its own.
 
 ## Rule format
 

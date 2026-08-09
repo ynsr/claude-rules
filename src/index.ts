@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ContextEvent, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { discoverRules, findRepoRoot } from "./discover";
 import { matchRule, normalizePath } from "./match";
 import { formatRules } from "./format";
@@ -6,6 +6,24 @@ import type { Rule } from "./rule";
 
 const PATH_TOOLS = new Set(["read", "edit", "write", "grep", "find", "ls"]);
 const GLOBS_TOOLS = new Set(["glob"]);
+
+/**
+ * Detect the oh-my-pi (omp) runtime. omp sets `OMPCODE=1`; base Pi
+ * (earendil-works/pi-coding-agent) does not. The `context`-event system-role
+ * injection below is only honored by omp's `convertToLlm`; base Pi's
+ * `defaultConvertToLlm` filters system-role messages out (silently dropped).
+ * Defaulting to false keeps Pi safe: without the marker we don't register the
+ * context handler and fall back to `before_agent_start` only.
+ */
+function isOmp(): boolean {
+  return typeof Bun !== "undefined" && Bun.env.OMPCODE === "1";
+}
+
+function dedupKey(r: Rule): string {
+  // Absolute path uniquely identifies a discovered rule; include mtime so an
+  // on-disk edit mid-session that triggers rediscovery isn't double-counted.
+  return `${r.file}@${r.mtimeMs}`;
+}
 
 // Only the glob tool address targets via `pattern`; the path-based tools
 // (read/edit/write/grep/find/ls) use `path`. Falling back to `pattern` for the
@@ -23,6 +41,12 @@ export default function claudeRules(pi: ExtensionAPI): void {
   let rules: Rule[] = [];
   let repoRoot = "";
   const touched = new Set<string>();
+  // Rules already injected this turn (via before_agent_start into the system
+  // prompt, or via the omp `context` event into a system message). Cleared at
+  // the top of before_agent_start, which fires once per user prompt before the
+  // tool loop. Prevents a rule from being sent twice in one turn (systemPrompt
+  // AND a context system message), while still re-injecting on later turns.
+  const injectedThisTurn = new Set<string>();
 
   pi.on("session_start", async (_event, ctx) => {
     // Normalize paths against the actual repo root (walk up to .git), so
@@ -30,6 +54,8 @@ export default function claudeRules(pi: ExtensionAPI): void {
     // starts from a subdirectory of the repository.
     repoRoot = findRepoRoot(ctx.cwd);
     rules = await discoverRules(ctx.cwd);
+    touched.clear();
+    injectedThisTurn.clear();
     if (rules.length > 0 && ctx.hasUI) {
       ctx.ui.notify(`claude-rules: ${rules.length} rule(s) found`, "info");
     }
@@ -45,11 +71,42 @@ export default function claudeRules(pi: ExtensionAPI): void {
   });
 
   pi.on("before_agent_start", async (event) => {
+    // Fires once per user prompt, before the tool loop runs any tool calls.
+    // `touched` only holds paths from PRIOR turns here, so a file touched for
+    // the first time this turn can't be injected by this hook — the `context`
+    // handler below fixes that in omp.
+    injectedThisTurn.clear();
     if (rules.length === 0) return;
     const matched = rules.filter((r) => matchRule(r, [...touched]));
     if (matched.length === 0) return;
+    for (const r of matched) injectedThisTurn.add(dedupKey(r));
     return {
       systemPrompt: event.systemPrompt + "\n\n" + formatRules(matched),
     };
   });
+
+  // omp-only mid-turn injection. The `context` event fires before every model
+  // step (agent-session transformContext → emitContext), so once a tool_call
+  // has recorded a matching path, the SAME turn's next step receives the rule —
+  // fixing the one-turn-behind limitation of before_agent_start. Base Pi's
+  // `defaultConvertToLlm` filters system-role messages out, so this is guarded
+  // to omp only; Pi relies on before_agent_start.
+  if (isOmp()) {
+    pi.on("context", (event: ContextEvent) => {
+      if (rules.length === 0) return;
+      const matched = rules.filter(
+        (r) => !injectedThisTurn.has(dedupKey(r)) && matchRule(r, [...touched]),
+      );
+      if (matched.length === 0) return;
+      for (const r of matched) injectedThisTurn.add(dedupKey(r));
+      // AgentMessage isn't exported from the public API; the system role is
+      // omp-only and not part of the base Message union, so cast it.
+      return {
+        messages: [
+          { role: "system", content: formatRules(matched) } as never,
+          ...event.messages,
+        ],
+      };
+    });
+  }
 }

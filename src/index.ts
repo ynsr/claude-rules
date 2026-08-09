@@ -25,6 +25,24 @@ function dedupKey(r: Rule): string {
   return `${r.file}@${r.mtimeMs}`;
 }
 
+// Contextual diagnostics. The structured logger (ctx.logger → ~/.omp/logs/omp.*.log)
+// is the reliable channel from the TUI-spawned session; plain console output
+// lands on the TUI's stdout and is not captured. We capture the logger at
+// session_start and route all subsequent diagnostics through it. The module-load
+// line (before any ctx) falls back to console.warn so loading is still visible.
+let _logger: { warn(m: string, c?: Record<string, unknown>): void } | undefined;
+let log = (_m: string, _c?: Record<string, unknown>): void => {};
+function adoptLogger(l: { warn(m: string, c?: Record<string, unknown>): void } | undefined): void {
+  _logger = l;
+  log = (m, c) => {
+    if (_logger) _logger.warn(`\n[claude-rules] ${m}`, c);
+    else console.warn(`\n[claude-rules] ${m}`, c ?? "");
+  };
+}
+function loadLog(m: string): void {
+  console.warn(`\n[claude-rules] ${m}`);
+}
+
 // Only the glob tool address targets via `pattern`; the path-based tools
 // (read/edit/write/grep/find/ls) use `path`. Falling back to `pattern` for the
 // latter would wrongly treat a grep/find search regex as a touched file path.
@@ -48,6 +66,8 @@ export default function claudeRules(pi: ExtensionAPI): void {
   // AND a context system message), while still re-injecting on later turns.
   const injectedThisTurn = new Set<string>();
 
+  loadLog(`extension loaded; omp=${isOmp()} OMPCODE=${Bun.env.OMPCODE}`);
+
   pi.on("session_start", async (_event, ctx) => {
     // Normalize paths against the actual repo root (walk up to .git), so
     // repo-relative rule globs (e.g. src/**/*.ts) match even when the session
@@ -56,6 +76,14 @@ export default function claudeRules(pi: ExtensionAPI): void {
     rules = await discoverRules(ctx.cwd);
     touched.clear();
     injectedThisTurn.clear();
+    // ctx.logger may be absent (e.g. pi mocks in tests); adoptLogger falls back to console.
+    adoptLogger(ctx.logger);
+    log("session_start",{
+      cwd: ctx.cwd,
+      repoRoot,
+      discovered: rules.length,
+      rules: rules.map((r) => `${r.name}(${r.paths.length}p${r.negated.length}n${r.alwaysApply ? ",always" : ""})`).join(" "),
+    });
     if (rules.length > 0 && ctx.hasUI) {
       ctx.ui.notify(`claude-rules: ${rules.length} rule(s) found`, "info");
     }
@@ -64,10 +92,18 @@ export default function claudeRules(pi: ExtensionAPI): void {
   pi.on("tool_call", async (event) => {
     const name = event.toolName;
     const input = event.input as Record<string, unknown>;
-    if (!PATH_TOOLS.has(name) && !GLOBS_TOOLS.has(name)) return;
+    if (!PATH_TOOLS.has(name) && !GLOBS_TOOLS.has(name)) {
+      log("tool_call skip (not path tool)", { name });
+      return;
+    }
     const p = capturePath(name, input);
-    if (p === undefined) return;
-    touched.add(normalizePath(p, repoRoot));
+    if (p === undefined) {
+      log("tool_call skip (no path)", { name, input: JSON.stringify(input) });
+      return;
+    }
+    const norm = normalizePath(p, repoRoot);
+    touched.add(norm);
+    log("tool_call", { name, raw: p, normalized: norm, repoRoot });
   });
 
   pi.on("before_agent_start", async (event) => {
@@ -76,8 +112,16 @@ export default function claudeRules(pi: ExtensionAPI): void {
     // the first time this turn can't be injected by this hook — the `context`
     // handler below fixes that in omp.
     injectedThisTurn.clear();
-    if (rules.length === 0) return;
+    if (rules.length === 0) {
+      log("before_agent_start no rules to match");
+      return;
+    }
     const matched = rules.filter((r) => matchRule(r, [...touched]));
+    log("before_agent_start", {
+      touched: touched.size,
+      matched: matched.map((r) => r.name).join(",") || "(none)",
+      injecting: matched.length > 0,
+    });
     if (matched.length === 0) return;
     for (const r of matched) injectedThisTurn.add(dedupKey(r));
     return {
@@ -93,10 +137,19 @@ export default function claudeRules(pi: ExtensionAPI): void {
   // to omp only; Pi relies on before_agent_start.
   if (isOmp()) {
     pi.on("context", (event: ContextEvent) => {
-      if (rules.length === 0) return;
+      if (rules.length === 0) {
+        log("context no rules to match");
+        return;
+      }
       const matched = rules.filter(
         (r) => !injectedThisTurn.has(dedupKey(r)) && matchRule(r, [...touched]),
       );
+      log("context", {
+        touched: touched.size,
+        matched: matched.map((r) => r.name).join(",") || "(none)",
+        injecting: matched.length > 0,
+        totalMsgs: event.messages.length,
+      });
       if (matched.length === 0) return;
       for (const r of matched) injectedThisTurn.add(dedupKey(r));
       // AgentMessage isn't exported from the public API; the system role is

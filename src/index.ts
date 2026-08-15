@@ -73,12 +73,12 @@ function adoptLogger(l: { warn(m: string, c?: Record<string, unknown>): void } |
       detail = `${m} (${parts.join(" ")})`;
     }
     // if (_logger) _logger.warn(`\n[claude-rules] ${detail}`);
-    else console.warn(`\n[claude-rules] ${detail}`);
+    // else console.log(`\n[claude-rules] ${detail}`);
   };
 }
 
 function loadLog(m: string): void {
-  console.warn(`\n[claude-rules] ${m}`);
+  // console.log(`\n[claude-rules] ${m}`);
 }
 
 // Only the glob tool address targets via `pattern`; the path-based tools

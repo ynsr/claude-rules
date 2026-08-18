@@ -5,11 +5,15 @@ Injects Claude Code `.claude/rules/*.md` rules into omp / Pi based on the
 `paths`, that rule's content is injected into the conversation (mid-session,
 like Claude Code) as user-role `<instructions>` content.
 
+Also supports DeepSeek Harness (DSH) via a Cordis plugin, injecting rules from
+both `.dsh/rules/*.md` and `.claude/rules/*.md` as `<system-reminder>` blocks.
+
 ## Why
 
 Claude Code supports `.claude/rules/*.md` files with `paths` frontmatter that scope
 rules to matching files. omp and Pi read `.claude/CLAUDE.md` but not
-`.claude/rules/*.md`. This extension closes that gap.
+`.claude/rules/*.md`. This extension closes that gap for omp/Pi, and extends
+the same progressive-disclosure behavior to DSH.
 
 ## Behavior
 
@@ -32,6 +36,8 @@ rules to matching files. omp and Pi read `.claude/CLAUDE.md` but not
   only when running under omp (detected via the `.omp` agent config dir, not
   `OMPCODE`, which omp sets only for spawned shells). Base Pi gets no
   automatic injection.
+- **DSH injection.** Under DSH, rules are injected as `<system-reminder>` user
+  messages via the agent inbox, using the same progressive-disclosure pattern.
 
 ## Install
 
@@ -56,6 +62,49 @@ cp claude-rules.ts ~/.omp/agent/extensions/   # or ~/.pi/agent/extensions/
 
 The bundle inlines the sibling modules, so `~/.omp/agent/extensions/claude-rules.ts`
 loads on its own.
+
+## DSH (DeepSeek Harness) Install
+
+The DSH plugin is a Cordis plugin that discovers rules from both `.dsh/rules/`
+and `.claude/rules/` directories, tracking file touches via `tools/result`
+events and injecting matched rules as `<system-reminder>` user-role messages
+through the agent inbox.
+
+**One-liner install** — add a row to your active profile's `cordis.patch.yml`:
+
+```bash
+# Add to the end of your profile's cordis.patch.yml
+cat >> ~/.dsh/profiles/web/cordis.patch.yml << 'EOF'
+
+# Path-scoped rules from .dsh/rules/*.md and .claude/rules/*.md
+- id: dsh-rules
+  name: '/path/to/claude-rules/src/dsh/plugin.ts'
+  config:
+    maxBytes: 65536
+EOF
+```
+
+Replace `/path/to/claude-rules` with the actual absolute path to this repo
+(e.g., `$(pwd)` if run from the repo root):
+
+```bash
+echo "
+- id: dsh-rules
+  name: '$(pwd)/src/dsh/plugin.ts'
+  config:
+    maxBytes: 65536
+" >> ~/.dsh/profiles/web/cordis.patch.yml
+```
+
+**Verification.** Restart the DSH server (or reload the profile). When you
+touch a file matching a rule's `paths` glob, the rule content appears as a
+`<system-reminder>` block in the conversation.
+
+**Discovery.**
+- `.dsh/rules/*.md` — project-specific rules (walked from cwd to repo root)
+- `.claude/rules/*.md` — cross-platform compatibility with existing rules
+- `~/.dsh/rules/` — user-global scope, applied last
+- `~/.claude/rules/` — user-global scope, cross-platform compatibility
 
 ## Disable omp's built-in claude-rules example
 
@@ -97,12 +146,20 @@ Prefer `const` over `let`. Use interfaces for objects.
 - `description` — optional, informational.
 - Nest rules in subdirectories; hidden files/dirs are skipped.
 
-## Discovery
+## Discovery (omp/Pi)
 
 Rules are discovered from every `.claude/rules/` directory walking from the current
 working directory up to the repo root (a directory containing `.git`), plus
 `~/.claude/rules/` (user scope, applied last). More-local rules win on name
 collisions.
+
+## Discovery (DSH)
+
+The DSH plugin discovers rules from both `.dsh/rules/` and `.claude/rules/`
+directories (same walk: cwd → repo root), plus `~/.dsh/rules/` and
+`~/.claude/rules/` for user-global scope. More-local rules win on name
+collisions, with `.dsh/rules` having equal precedence to `.claude/rules` within
+the same directory.
 
 ## Matching
 

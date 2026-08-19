@@ -246,15 +246,15 @@ export function apply(ctx: Context, config: DshRulesConfig = {}): void {
 
   let discovered = false;
 
-  function ensureDiscovered() {
+  function ensureDiscovered(sessionCwd: string) {
     if (discovered) {
       log.debug("ensureDiscovered: already discovered, skipping");
       return;
     }
     discovered = true;
-    repoRoot = findRepoRoot(process.cwd());
-    log.info(`ensureDiscovered: repoRoot=${repoRoot}, cwd=${process.cwd()}`);
-    rules = discoverDshRules(process.cwd(), log);
+    repoRoot = findRepoRoot(sessionCwd);
+    log.info(`ensureDiscovered: repoRoot=${repoRoot}, sessionCwd=${sessionCwd}`);
+    rules = discoverDshRules(sessionCwd, log);
     log.info(`ensureDiscovered: ${rules.length} rules loaded`);
   }
 
@@ -286,7 +286,7 @@ export function apply(ctx: Context, config: DshRulesConfig = {}): void {
   const disposer2 = ctx.on("tools/result", (...args: unknown[]) => {
     const exec = args[0] as {
       name: string; arguments: Record<string, unknown>;
-      agent?: { session: { id: string }; inbox: { prepend: (target: string, msg: unknown) => void } };
+      agent?: { session: { id: string; header?: { cwd?: string } }; inbox: { prepend: (target: string, msg: unknown) => void } };
     } | undefined;
     const result = args[1] as { isError: boolean } | undefined;
     if (!exec || !result) {
@@ -314,7 +314,9 @@ export function apply(ctx: Context, config: DshRulesConfig = {}): void {
     if (exec.agent) {
       log.info(`tools/result: processing file_path="${filePath}" for session ${exec.agent.session.id}`);
 
-      ensureDiscovered();
+      const sessionCwd = exec.agent.session.header?.cwd ?? process.cwd();
+      log.debug(`tools/result: session cwd="${sessionCwd}"`);
+      ensureDiscovered(sessionCwd);
 
       const norm = normalizePath(filePath.trim(), repoRoot);
       touched.add(norm);

@@ -4,5 +4,5 @@
  * Re-exports the plugin factory and utility functions for external use.
  */
 
-export { apply, discoverDshRules, formatDshRules, clearDshRuleCache } from "./plugin";
-export type { DshRulesConfig } from "./plugin";
+export { apply, discoverDshRules, formatDshRules, clearDshRuleCache } from "./plugin.ts";
+export type { DshRulesConfig, LogLevel } from "./plugin.ts";

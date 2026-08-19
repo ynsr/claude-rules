@@ -1,4 +1,4 @@
-import type { Rule } from "./rule";
+import type { Rule } from "./rule.ts";
 
 /**
  * Format injected rules so each section's first line is the FULL path of the

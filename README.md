@@ -77,10 +77,11 @@ through the agent inbox.
 cat >> ~/.dsh/profiles/web/cordis.patch.yml << 'EOF'
 
 # Path-scoped rules from .dsh/rules/*.md and .claude/rules/*.md
-- id: dsh-rules
-  name: '/path/to/claude-rules/src/dsh/plugin.ts'
-  config:
-    maxBytes: 65536
+- insert:
+    - id: dsh-rules
+      name: '/path/to/claude-rules/src/dsh/plugin.ts'
+      config:
+        maxBytes: 65536
 EOF
 ```
 
@@ -89,16 +90,28 @@ Replace `/path/to/claude-rules` with the actual absolute path to this repo
 
 ```bash
 echo "
-- id: dsh-rules
-  name: '$(pwd)/src/dsh/plugin.ts'
-  config:
-    maxBytes: 65536
+- insert:
+    - id: dsh-rules
+      name: '$(pwd)/src/dsh/plugin.ts'
+      config:
+        maxBytes: 65536
 " >> ~/.dsh/profiles/web/cordis.patch.yml
 ```
 
-**Verification.** Restart the DSH server (or reload the profile). When you
-touch a file matching a rule's `paths` glob, the rule content appears as a
-`<system-reminder>` block in the conversation.
+**Important:** The `cordis.patch.yml` format uses a top-level YAML array of
+loader patch entries. To **add a new plugin row** (rather than override an
+existing one), you must wrap it in an `insert:` block. A bare entry like
+`- id: dsh-rules` is an **override** — it silently does nothing when the
+target `id` does not already exist in the composition. Verify with:
+
+```bash
+dsh --profile web --dump-config | grep dsh-rules
+```
+
+**Verification.** Restart the DSH server (or reload the profile). Run
+`dsh --profile web --dump-config | grep -A4 'dsh-rules'` and confirm the row
+appears. When you touch a file matching a rule's `paths` glob, the rule content
+appears as a `<system-reminder>` block in the conversation.
 
 **Discovery.**
 - `.dsh/rules/*.md` — project-specific rules (walked from cwd to repo root)

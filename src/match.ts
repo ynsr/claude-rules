@@ -1,7 +1,7 @@
 import os from "node:os";
 import path from "node:path";
-import { matchGlob } from "./glob";
-import type { Rule } from "./rule";
+import { matchGlob } from "./glob.ts";
+import type { Rule } from "./rule.ts";
 
 export function normalizePath(p: string, repoRoot: string): string {
   let s = p;

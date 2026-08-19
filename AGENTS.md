@@ -80,3 +80,30 @@ cp claude-rules.ts ~/.omp/agent/extensions/   # install as drop-in copy (Option 
 - **Token-gap test:** mock `model: { contextWindow: 4000 }` → gap = 1000 tokens; chars/4 estimate (5000 chars = 1250 tokens triggers re-inject; 1 token does not).
 - **Conventions:** `mkdtempSync("claude-rules-")` per test in `beforeEach`, `rmSync` in `afterAll`; `discover.test.ts` calls `clearRuleCache()` in `beforeEach`.
 - **When changing behavior,** update the matching `context.test.ts` assertions — the injected `<instructions>` message must be appended last, start/end with the tags, and lead with `Contents of <absolute path>:`.
+
+## DSH Profile Patch Format
+
+When editing `cordis.patch.yml` for a DSH profile, entries are loader patch
+entries, not raw composition rows. There are two forms:
+
+1. **Override an existing entry** — match by `id`:
+   ```yaml
+   - id: existing-row-id
+     config:
+       key: value
+   ```
+   Silently does nothing if the `id` does not exist in the base composition.
+
+2. **Insert a new row** — wrap in an `insert:` block:
+   ```yaml
+   - insert:
+       - id: my-new-plugin
+         name: '@scope/package'
+         config:
+           key: value
+   ```
+   This is the only way to add a new plugin row. Use `dsh --profile <name> --dump-config | grep <id>` to verify the row appears.
+
+A bare `- id: ...` without `insert:` is always an **override** — it will not
+add a new row, and the loader warns "patch: entry \<id\> not found" without
+failing.

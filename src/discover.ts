@@ -1,8 +1,8 @@
 import { readdirSync, readFileSync, statSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
-import type { Rule } from "./rule";
-import { parseRule } from "./rule";
+import type { Rule } from "./rule.ts";
+import { parseRule } from "./rule.ts";
 
 const cache = new Map<string, { mtimeMs: number; rule: Rule }>();
 

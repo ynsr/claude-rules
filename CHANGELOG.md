@@ -5,6 +5,10 @@ All notable changes to this project are documented here.
 ## [Unreleased]
 
 ### Added
+- `install.sh`: one-command build + install for both hosts — rebuilds the omp
+  bundle into `~/.omp/agent/extensions/`, ensures the `dsh-rules` source-path
+  row in the web+lite `cordis.patch.yml` files (repoints the stale pre-rename
+  path). Idempotent; `--check` dry-runs, `--skip-dsh` / `--profiles` narrow it.
 - Guaranteed-delivery injection via `tool_result`: matching rules + nested
   `AGENTS.md` are appended as trailing `<instructions>` text on the tool result
   the model sees next (fires synchronously in the agent tool loop). Shares

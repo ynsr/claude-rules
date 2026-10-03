@@ -67,14 +67,21 @@ extensions:
   - /path/to/claude-rules-for-omp/src/index.ts
 ```
 
-**Option B — split bundles, host-provided deps (drop-in copies).** Each bundle
-externalizes its host packages (installed, not inlined), so output stays small:
+**One-command install (both hosts).** From the repo root:
 
 ```bash
-bun run build:omp   # → claude-rules-for-omp.ts (external: @earendil-works/pi-coding-agent)
-bun run build:dsh   # → dsh-rules.ts (external: @deepseek-ai/cordis, @deepseek-ai/dsh-llm)
-cp claude-rules-for-omp.ts ~/.omp/agent/extensions/   # or ~/.pi/agent/extensions/
+./install.sh                  # build omp bundle, install, patch web+lite DSH profiles
+./install.sh --check          # dry run: print what would change, change nothing
+./install.sh --skip-dsh       # omp bundle only
+./install.sh --profiles web   # only patch the web DSH profile
 ```
+
+The script is idempotent: re-running rebuilds + overwrites the omp bundle at
+`~/.omp/agent/extensions/claude-rules-for-omp.ts`, appends the `dsh-rules`
+source-path row to each profile's `cordis.patch.yml` only if absent, and
+repoints the stale pre-rename `claude-rules/src/dsh/plugin.ts` path. Restart
+omp sessions / reload DSH profiles afterwards.
+
 
 The omp bundle ships zero runtime dependencies (token estimate is a local
 chars/4 helper; the pi package is types-only). The DSH bundle imports

@@ -78,16 +78,19 @@ function loadLog(m: string): void {
   // console.log(`\n[claude-rules-for-omp] ${m}`);
 }
 
-// Only the glob tool address targets via `pattern`; the path-based tools
-// (read/edit/write/grep/find/ls) use `path`. Falling back to `pattern` for the
-// latter would wrongly treat a grep/find search regex as a touched file path.
+// The glob tool addresses targets via `pattern`, but real sessions show omp
+// also sends `{ path: "<glob>" }` (see 2026-10-03 SecurityConfig sessions:
+// `glob {"path":"**/SecurityConfig.java"}`). Accept both; for the path-based
+// tools (read/edit/write/grep/find/ls) only `path` counts — falling back to
+// `pattern` there would wrongly treat a grep/find search regex as a touched
+// file path.
 export function capturePath(
   name: string,
   input: Record<string, unknown> | undefined,
 ): string | undefined {
-  const p = GLOBS_TOOLS.has(name) ? input?.pattern : input?.path;
-  if (typeof p !== "string" || p === "") return undefined;
-  return p;
+  const raw = GLOBS_TOOLS.has(name) ? (input?.pattern ?? input?.path) : input?.path;
+  if (typeof raw !== "string" || raw === "") return undefined;
+  return raw;
 }
 
 // Prompt-referenced files are matched against rule paths even when no tool has
@@ -170,6 +173,32 @@ export default function claudeRulesForOmp(pi: ExtensionAPI): void {
     });
   });
 
+  // Merge newly discovered descendant AGENTS.md docs (found via touched
+  // paths below the session root) into the session list without duplicates.
+  // Ancestor docs come from session_start; touched-path chains add docs
+  // below cwd. Dedup by absolute file path; ancestors stay first, leaf last.
+  function mergeAgents(docs: AgentDoc[]): void {
+    const seen = new Set(agents.map((a) => a.file));
+    for (const d of docs) {
+      if (seen.has(d.file)) continue;
+      seen.add(d.file);
+      agents.push(d);
+    }
+  }
+
+  // Absolute directory scopes that may hold descendant AGENTS.md docs for the
+  // currently touched paths: each touched repo-relative path resolved against
+  // repoRoot, walked by discoverAgents from its directory up to sessionCwd.
+  function touchedDirs(): string[] {
+    const dirs: string[] = [];
+    for (const tp of touched) {
+      const abs = tp.startsWith("/") ? tp : `${repoRoot}/${tp}`;
+      const slash = abs.lastIndexOf("/");
+      dirs.push(slash > 0 ? abs.slice(0, slash) : abs);
+    }
+    return dirs;
+  }
+
   pi.on("tool_call", async (event) => {
     const toolName = event.toolName;
     const name = typeof toolName === "string" ? toolName : "";
@@ -186,6 +215,7 @@ export default function claudeRulesForOmp(pi: ExtensionAPI): void {
     }
     const norm = normalizePath(p, repoRoot);
     touched.add(norm);
+    mergeAgents(discoverAgents(sessionCwd, touchedDirs()));
     log("tool_call", { name, raw: p, normalized: norm, repoRoot });
   });
 
@@ -212,17 +242,35 @@ export default function claudeRulesForOmp(pi: ExtensionAPI): void {
   // filters system-role messages out, so this is guarded to omp only.
   if (isOmp()) {
     pi.on("context", async (event: ContextEvent) => {
-      // omp expands `@path` prompt mentions into a separate user message whose
-      // content is a `<file path="…">` block. Capture those injected paths so
-      // the file matches path-scoped rules even though no tool_call touched it.
-      for (const msg of event.messages) {
-        // AgentMessage is a union (incl. BashExecutionMessage with no
-        // `content`); narrow with `in` so the access is checked.
-        if (!msg || typeof msg !== "object" || !("content" in msg)) continue;
-        for (const raw of extractPromptPaths(contentText(msg.content))) {
-          touched.add(normalizePath(raw, repoRoot));
+      // omp expands `@path` prompt mentions into a separate user message. Two
+      // shapes observed (2026-10-03 session): a text `<file path="…">` block
+      // (handled by extractPromptPaths on content text) and a structured
+      // `fileMention` role message carrying `files[].path` with no text
+      // content (contentText yields "" there). Capture both so the file
+      // matches path-scoped rules even though no tool_call touched it.
+      for (const rawMsg of event.messages) {
+        // Real sessions carry a `fileMention` role message outside the typed
+        // AgentMessage union — narrow from unknown so the check compiles.
+        const msg: unknown = rawMsg;
+        if (!msg || typeof msg !== "object") continue;
+        if ("content" in msg) {
+          const content = msg.content;
+          for (const raw of extractPromptPaths(contentText(content))) {
+            touched.add(normalizePath(raw, repoRoot));
+          }
+        }
+        if ("role" in msg && msg.role === "fileMention" && "files" in msg && Array.isArray(msg.files)) {
+          for (const f of msg.files) {
+            if (f && typeof f === "object" && "path" in f && typeof f.path === "string") {
+              touched.add(normalizePath(f.path, repoRoot));
+            }
+          }
         }
       }
+      // Descendant AGENTS.md docs below the session root are only knowable
+      // via touched paths (see discoverAgents): merge any newly visible
+      // ones before matching so this same step can inject them.
+      mergeAgents(discoverAgents(sessionCwd, touchedDirs()));
       const currentTokens = event.messages.reduce((acc, m) => acc + estimateTokensLocal(m), 0);
       // Compaction: sharp token drop since the last step. Re-discover from
       // disk (mtime cache makes unchanged files free) and allow re-injection.

@@ -1,0 +1,1 @@
+This is a test AGENTS.md to check if the nested AGENTS.md files are being read correctly. The content of this file should be processed in a depth-first manner, similar to how the rules are progressively exposed.

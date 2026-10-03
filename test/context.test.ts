@@ -132,6 +132,86 @@ describe("context-event mid-turn injection (omp)", () => {
     });
   });
 
+  test("records a glob tool_call sent as { path } (real omp shape)", async () => {
+    await withOmp(true, async () => {
+      const repo = makeRepo();
+      const pi = makePi();
+      claudeRules(pi as unknown as ExtensionAPI);
+      await pi.emit("session_start", {}, { cwd: repo, hasUI: false, ui: {} });
+      await pi.emit("before_agent_start", { systemPrompt: "BASE", prompt: "Summarize SecurityConfig.java" });
+      // Real 2026-10-03 session: omp sends the glob target as `path`, not
+      // `pattern`. This must still count as touching the file's directory so
+      // a later `read` of the resolved file matches (and the glob alone must
+      // not crash or match spuriously).
+      await pi.emit("tool_call", {
+        toolName: "glob",
+        input: { i: "Locating SecurityConfig file", path: "src/security/SecurityConfig.java" },
+      });
+      const ctx = asHookResult(
+        await pi.emit("context", { messages: [{ role: "user", content: "summarize" }] }),
+      );
+      const injected = ctx?.messages?.find(isInstructionsMessage);
+      expect(injected).toBeDefined();
+      if (injected) expect(injected.content).toContain("BE SECURE");
+    });
+  });
+
+  test("injects descendant AGENTS.md below session root for a touched file (no tool read)", async () => {
+    await withOmp(true, async () => {
+      const repo = makeRepo();
+      mkdirSync(path.join(repo, "src", "main", "java"), { recursive: true });
+      writeFileSync(path.join(repo, "src", "main", "java", "AGENTS.md"), "# Java scope\nJAVA SCOPE\n");
+      const pi = makePi();
+      claudeRules(pi as unknown as ExtensionAPI);
+      await pi.emit("session_start", {}, { cwd: repo, hasUI: false, ui: {} });
+      // Exact 2026-10-03 failure shape: session at repo root, `@path` prompt
+      // mention only — no tool_call ever runs before the summary step.
+      await pi.emit("before_agent_start", {
+        systemPrompt: "BASE",
+        prompt: "Summarize @src/main/java/ir/jibit/projectx/config/security/SecurityConfig.java",
+      });
+      const ctx = asHookResult(
+        await pi.emit("context", {
+          messages: [{ role: "user", content: "Summarize @src/main/java/ir/jibit/projectx/config/security/SecurityConfig.java" }],
+        }),
+      );
+      const injected = ctx?.messages?.find(isInstructionsMessage);
+      expect(injected).toBeDefined();
+      if (injected) expect(injected.content).toContain("JAVA SCOPE");
+    });
+  });
+
+  test("injects rule + descendant AGENTS.md from a fileMention message (omp @path shape)", async () => {
+    await withOmp(true, async () => {
+      const repo = makeRepo();
+      mkdirSync(path.join(repo, "src", "security"), { recursive: true });
+      writeFileSync(path.join(repo, "src", "security", "AGENTS.md"), "# Sec scope\nSEC SCOPE\n");
+      const pi = makePi();
+      claudeRules(pi as unknown as ExtensionAPI);
+      await pi.emit("session_start", {}, { cwd: repo, hasUI: false, ui: {} });
+      await pi.emit("before_agent_start", {
+        systemPrompt: "BASE",
+        prompt: "Summarize @src/security/SecurityConfig.java",
+      });
+      // Exact 2026-10-03 session shape: omp expands the `@path` mention into
+      // a structured fileMention message (files[].path, no text content).
+      const ctx = asHookResult(
+        await pi.emit("context", {
+          messages: [
+            { role: "user", content: "Summarize @src/security/SecurityConfig.java" },
+            { role: "fileMention", files: [{ path: "src/security/SecurityConfig.java" }] },
+          ],
+        }),
+      );
+      const injected = ctx?.messages?.find(isInstructionsMessage);
+      expect(injected).toBeDefined();
+      if (injected) {
+        expect(injected.content).toContain("BE SECURE");
+        expect(injected.content).toContain("SEC SCOPE");
+      }
+    });
+  });
+
   test("inject-once: growth never re-injects; compaction (>30% drop) re-injects", async () => {
     await withOmp(true, async () => {
       const repo = makeRepo();

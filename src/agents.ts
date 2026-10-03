@@ -40,17 +40,24 @@ function readAgentFile(full: string, scopeDir: string): AgentDoc | undefined {
 /**
  * Discover nested AGENTS.md files depth-first (root → leaf).
  *
- * Walks from repoRoot down to cwd, collecting `<dir>/AGENTS.md` at each depth
- * in order so ancestors come first and the nearest (leaf) doc comes last
- * (leaf wins by position when stacked). The harness itself injects the
- * session-startup (cwd-root) AGENTS.md, so the file exactly at `cwd` is
- * skipped — only strictly-nested AGENTS.md files below the session root are
- * returned. Home-global `~/AGENTS.md` is never collected (harness-owned).
+ * Two sources, both ancestor-ordered:
+ *   1. Ancestors of `cwd` (repoRoot → cwd parent). The harness injects the
+ *      session-startup (cwd-root) AGENTS.md itself, so the file exactly at
+ *      `cwd` is skipped — only strictly-ancestor docs above the session root
+ *      are returned here.
+ *   2. Descendants below `cwd` on the ancestor chain of each touched path:
+ *      walking from the touched file's directory up to (but excluding) `cwd`,
+ *      collecting `<dir>/AGENTS.md` at each depth. This covers the reported
+ *      failure mode (2026-10-03): session at repo root touching
+ *      `src/main/java/.../SecurityConfig.java` must pick up
+ *      `src/main/java/AGENTS.md`, which is neither an ancestor of cwd nor
+ *      knowable without the touched path. Home-global `~/AGENTS.md` is never
+ *      collected (harness-owned).
  */
-export function discoverAgents(cwd: string): AgentDoc[] {
+export function discoverAgents(cwd: string, touchedAbsDirs: string[] = []): AgentDoc[] {
   const resolvedCwd = path.resolve(cwd);
   const root = findRepoRoot(resolvedCwd);
-  // Depths from root → cwd.
+  // Depths from root → cwd parent (cwd file itself is harness-owned: skip).
   const depths: string[] = [];
   let dir = resolvedCwd;
   for (;;) {
@@ -64,13 +71,32 @@ export function discoverAgents(cwd: string): AgentDoc[] {
 
   const out: AgentDoc[] = [];
   const seen = new Set<string>();
-  for (const d of depths) {
-    if (path.resolve(d) === resolvedCwd) continue; // harness-owned, skip
+  const collect = (d: string): void => {
     const full = path.join(d, "AGENTS.md");
-    if (seen.has(full) || !existsSync(full)) continue;
+    if (seen.has(full) || !existsSync(full)) return;
     seen.add(full);
     const doc = readAgentFile(full, d);
     if (doc) out.push(doc);
+  };
+  for (const d of depths) {
+    if (path.resolve(d) === resolvedCwd) continue; // harness-owned, skip
+    collect(d);
+  }
+  // Descendant docs on each touched path's ancestor chain below cwd.
+  // Nearest-scope doc is the most specific match; emit leaf-first so the
+  // closest doc sorts last in the stacked order used at injection time.
+  for (const absDir of touchedAbsDirs) {
+    const chain: string[] = [];
+    let d = path.resolve(absDir);
+    for (;;) {
+      if (!d.startsWith(resolvedCwd + path.sep) && d !== resolvedCwd) break;
+      if (d === resolvedCwd) break;
+      chain.push(d);
+      const parent = path.dirname(d);
+      if (parent === d) break;
+      d = parent;
+    }
+    for (const c of chain) collect(c);
   }
   return out;
 }

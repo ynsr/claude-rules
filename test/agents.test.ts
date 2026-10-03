@@ -37,6 +37,23 @@ describe("agents", () => {
     expect(discoverAgents(repo)).toEqual([]);
   });
 
+  test("discovers descendant AGENTS.md on the touched path chain below cwd", () => {
+    const repo = makeRepo();
+    // Session at repo root: ancestors contribute nothing, but the touched
+    // file's ancestor chain below cwd yields sub/AGENTS.md (leaf-first).
+    const docs = discoverAgents(repo, [path.join(repo, "sub", "deep")]);
+    expect(docs.map((d) => d.file)).toEqual([
+      path.join(repo, "sub", "deep", "AGENTS.md"),
+      path.join(repo, "sub", "AGENTS.md"),
+    ]);
+  });
+
+  test("ignores touched dirs outside the session root", () => {
+    const repo = makeRepo();
+    expect(discoverAgents(repo, [path.join(tmp, "elsewhere")])).toEqual([]);
+    expect(discoverAgents(repo, [])).toEqual([]);
+  });
+
   test("matches only touched paths under the doc scope dir", () => {
     const repo = makeRepo();
     const docs = discoverAgents(path.join(repo, "sub", "deep"));

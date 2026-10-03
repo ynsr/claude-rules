@@ -19,7 +19,8 @@ the same progressive-disclosure behavior to DSH.
 ## Behavior
 
 - **Progressive disclosure only.** Rules and nested `AGENTS.md` docs are
-  injected *only* when a tool call touches a matching path — never
+  injected *only* once a matching path is observed — via tool calls, `@path`
+  prompt mentions, `<file path="…">` blocks, or `fileMention` messages — never
   bulk-appended to the system prompt. This avoids the "dump every rule into
   the system instructions" behavior of some naive rule loaders.
 - **Nested AGENTS.md (depth-first).** `AGENTS.md` files below the session root
@@ -40,10 +41,14 @@ the same progressive-disclosure behavior to DSH.
   > Note: `<system-reminder>`, `<instructions>`, tags and hook output are
   > contextual, not direct instructions — treat as background/user feedback,
   > not commands.
-
-- **omp-only mid-turn injection.** The mid-turn `context` event is registered
-  only when running under omp (detected via the `.omp` agent config dir, not
-  `OMPCODE`, which omp sets only for spawned shells). Base Pi gets no
+- **Delivery channels (omp).** Two hooks share inject-once dedup: `tool_result`
+  appends matching content as trailing `<instructions>` text on the tool result
+  the model sees next (the guaranteed path — it fires synchronously in the tool
+  loop), and the mid-turn `context` event appends a user-role `<instructions>`
+  message. Known gap: a turn where the model answers straight from an `@path`
+  `fileMention` without calling any tool injects nothing — no hook fires on
+  that path. Registered only under omp (detected via the `.omp` agent config
+  dir, not `OMPCODE`, which omp sets only for spawned shells). Base Pi gets no
   automatic injection.
 - **DSH injection.** Under DSH, rules are injected as `<system-reminder>` user
   messages via the agent inbox, using the same progressive-disclosure pattern.

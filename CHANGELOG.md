@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Added
+- Guaranteed-delivery injection via `tool_result`: matching rules + nested
+  `AGENTS.md` are appended as trailing `<instructions>` text on the tool result
+  the model sees next (fires synchronously in the agent tool loop). Shares
+  inject-once dedup, formatted cache, and section rendering with the `context`
+  path. Known gap: a turn where the model answers an `@path` mention without
+  calling any tool injects nothing — no hook fires on that path.
+
 ### Changed
 - Renamed package to `claude-rules-for-omp` (omp factory `claudeRulesForOmp`,
   `claudeRules` kept as alias); DSH plugin stays `dsh-rules` / `dsh-rules.ts`.

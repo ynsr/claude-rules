@@ -1,9 +1,10 @@
-# claude-rules
+# claude-rules-for-omp
 
-Injects Claude Code `.claude/rules/*.md` rules into omp / Pi based on the
-`paths` frontmatter property. When the session touches a file matching a rule's
-`paths`, that rule's content is injected into the conversation (mid-session,
-like Claude Code) as user-role `<instructions>` content.
+Injects Claude Code `.claude/rules/*.md` rules and nested `AGENTS.md` docs into
+omp / Pi based on the `paths` frontmatter property (rules) and directory scope
+(AGENTS.md). When the session touches a file matching a rule's `paths` or
+inside an AGENTS.md scope dir, that content is injected into the conversation
+(mid-session, like Claude Code) as user-role `<instructions>` content.
 
 Also supports DeepSeek Harness (DSH) via a Cordis plugin, injecting rules from
 both `.dsh/rules/*.md` and `.claude/rules/*.md` as `<system-reminder>` blocks.
@@ -17,10 +18,18 @@ the same progressive-disclosure behavior to DSH.
 
 ## Behavior
 
-- **Progressive disclosure only.** Rules are injected *only* when a tool call
-  touches a matching path — never bulk-appended to the system prompt. This
-  avoids the "dump every rule into the system instructions" behavior of some
-  naive rule loaders.
+- **Progressive disclosure only.** Rules and nested `AGENTS.md` docs are
+  injected *only* when a tool call touches a matching path — never
+  bulk-appended to the system prompt. This avoids the "dump every rule into
+  the system instructions" behavior of some naive rule loaders.
+- **Nested AGENTS.md (depth-first).** `AGENTS.md` files below the session root
+  apply when a touched path is inside their directory (root → leaf order, leaf
+  wins by position). The `AGENTS.md` at the session cwd is skipped — the
+  harness injects it at startup.
+- **Inject-once + compaction re-read.** Each item injects once per session;
+  growth never re-injects. Re-discovery + re-injection happens only on
+  compaction (estimated conversation drops >30% and >5K tokens; DSH also
+  honors explicit compaction events).
 - **Full rule path.** Each injected rule's first line is the full absolute path
   of the rule file (e.g. `Contents of /path/to/.claude/rules/ts.md:`), so the
   model knows exactly which file each rule came from.
@@ -42,7 +51,7 @@ the same progressive-disclosure behavior to DSH.
 ## Install
 
 The extension is split across modules (`src/discover.ts`, `match.ts`, `format.ts`,
-`rule.ts`, `glob.ts`). It cannot be installed by copying `src/index.ts` alone —
+`rule.ts`, `glob.ts`, `agents.ts`). It cannot be installed by copying `src/index.ts` alone —
 its relative imports would fail to resolve outside the repo.
 
 **Option A — reference the source path directly (recommended).** No copy needed;
@@ -50,18 +59,21 @@ relative imports resolve within the repo. Via `config.yml`:
 
 ```yaml
 extensions:
-  - /path/to/claude-rules/src/index.ts
+  - /path/to/claude-rules-for-omp/src/index.ts
 ```
 
-**Option B — bundle to a single self-contained file** for a drop-in copy:
+**Option B — split bundles, host-provided deps (drop-in copies).** Each bundle
+externalizes its host packages (installed, not inlined), so output stays small:
 
 ```bash
-bun build src/index.ts --target=bun --outfile=claude-rules.ts
-cp claude-rules.ts ~/.omp/agent/extensions/   # or ~/.pi/agent/extensions/
+bun run build:omp   # → claude-rules-for-omp.ts (external: @earendil-works/pi-coding-agent)
+bun run build:dsh   # → dsh-rules.ts (external: @deepseek-ai/cordis, @deepseek-ai/dsh-llm)
+cp claude-rules-for-omp.ts ~/.omp/agent/extensions/   # or ~/.pi/agent/extensions/
 ```
 
-The bundle inlines the sibling modules, so `~/.omp/agent/extensions/claude-rules.ts`
-loads on its own.
+The omp bundle ships zero runtime dependencies (token estimate is a local
+chars/4 helper; the pi package is types-only). The DSH bundle imports
+`@deepseek-ai/cordis` / `@deepseek-ai/dsh-llm` from the host at load time.
 
 ## DSH (DeepSeek Harness) Install
 
@@ -79,13 +91,13 @@ cat >> ~/.dsh/profiles/web/cordis.patch.yml << 'EOF'
 # Path-scoped rules from .dsh/rules/*.md and .claude/rules/*.md
 - insert:
     - id: dsh-rules
-      name: '/path/to/claude-rules/src/dsh/plugin.ts'
+      name: '/path/to/claude-rules-for-omp/src/dsh/plugin.ts'
       config:
         maxBytes: 65536
 EOF
 ```
 
-Replace `/path/to/claude-rules` with the actual absolute path to this repo
+Replace `/path/to/claude-rules-for-omp` with the actual absolute path to this repo
 (e.g., `$(pwd)` if run from the repo root):
 
 ```bash
@@ -130,13 +142,13 @@ only this extension (with real `paths`-based progressive disclosure) runs:
 
 - **Remove the installed copy** if you copied it into an extensions dir:
   ```bash
-  rm ~/.omp/agent/extensions/claude-rules.ts   # or wherever you dropped it
+  rm ~/.omp/agent/extensions/claude-rules.ts ~/.omp/agent/extensions/claude-rules-for-omp.ts   # or wherever you dropped it
   ```
 - **Or disable it via `disabledExtensions`** in `~/.omp/agent/config.yml`
   (extension capability id is `extensions`, name is the file basename):
   ```yaml
   disabledExtensions:
-    - extensions:claude-rules
+    - extensions:claude-rules-for-omp
   ```
 
 ## Rule format
@@ -164,13 +176,14 @@ Prefer `const` over `let`. Use interfaces for objects.
 Rules are discovered from every `.claude/rules/` directory walking from the current
 working directory up to the repo root (a directory containing `.git`), plus
 `~/.claude/rules/` (user scope, applied last). More-local rules win on name
-collisions.
+collisions. Nested `AGENTS.md` files below the session cwd are discovered
+root → leaf (session-cwd file skipped, harness-owned).
 
 ## Discovery (DSH)
-
 The DSH plugin discovers rules from both `.dsh/rules/` and `.claude/rules/`
 directories (same walk: cwd → repo root), plus `~/.dsh/rules/` and
-`~/.claude/rules/` for user-global scope. More-local rules win on name
+`~/.claude/rules/` for user-global scope. Nested `AGENTS.md` files below the
+session cwd are discovered root → leaf. More-local rules win on name
 collisions, with `.dsh/rules` having equal precedence to `.claude/rules` within
 the same directory.
 

@@ -7,7 +7,7 @@ import { discoverRules, clearRuleCache, findRepoRoot } from "../src/discover";
 let tmp: string;
 beforeEach(() => {
   clearRuleCache();
-  tmp = mkdtempSync(path.join(tmpdir(), "claude-rules-"));
+  tmp = mkdtempSync(path.join(tmpdir(), "claude-rules-for-omp-"));
 });
 
 afterAll(() => {

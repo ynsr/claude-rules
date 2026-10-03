@@ -23,7 +23,7 @@ interface MockPi {
 
 let tmp: string;
 beforeEach(() => {
-  tmp = mkdtempSync(path.join(tmpdir(), "claude-rules-ctx-"));
+  tmp = mkdtempSync(path.join(tmpdir(), "claude-rules-for-omp-ctx-"));
 });
 
 afterAll(() => {
@@ -114,11 +114,9 @@ describe("context-event mid-turn injection (omp)", () => {
       const ctx1 = asHookResult(
         await pi.emit("context", { messages: [{ role: "user", content: "summarize" }] }),
       );
-      expect(ctx1).not.toBeUndefined();
       const injected = ctx1?.messages?.find(isInstructionsMessage);
       expect(injected).toBeDefined();
       if (!injected) throw new Error("expected an injected <instructions> message");
-      // The injected rule's first line is the FULL path of the rule file.
       expect(injected.content).toContain(`Contents of ${path.join(repo, ".claude", "rules", "security.md")}:`);
       expect(injected.content).toContain("# Security Rules");
       expect(injected.content).toContain("BE SECURE");
@@ -134,7 +132,7 @@ describe("context-event mid-turn injection (omp)", () => {
     });
   });
 
-  test("dedups: a rule injected once this turn is not re-injected on later context events", async () => {
+  test("inject-once: growth never re-injects; compaction (>30% drop) re-injects", async () => {
     await withOmp(true, async () => {
       const repo = makeRepo();
       const pi = makePi();
@@ -145,54 +143,30 @@ describe("context-event mid-turn injection (omp)", () => {
         input: { path: "src/security/SecurityConfig.java" },
       });
 
+      // First context injects it.
       const ctx1 = asHookResult(
         await pi.emit("context", { messages: [{ role: "user", content: "a" }] }),
       );
       expect(ctx1?.messages?.filter(isInstructionsMessage).length).toBe(1);
 
-      // Same turn, another model step: rule already injected → no instructions block.
-      const ctx2 = await pi.emit("context", { messages: [{ role: "user", content: "b" }] });
-      expect(ctx2).toBeUndefined();
-    });
-  });
-
-  test("re-injects on a later turn once the token gap is exceeded", async () => {
-    await withOmp(true, async () => {
-      const repo = makeRepo();
-      const pi = makePi();
-      claudeRules(pi as unknown as ExtensionAPI);
-      // Mock model claims a 4K window → tokenGap = min(4000*0.25, 70K) = 1000.
-      await pi.emit("session_start", {}, { cwd: repo, hasUI: false, ui: {}, model: { contextWindow: 4000 } });
-      await pi.emit("tool_call", {
-        toolName: "read",
-        input: { path: "src/security/SecurityConfig.java" },
-      });
-
-      // Turn 1: context injects it. currentTokens = ceil(1/4) = 1.
-      const turn1 = asHookResult(
-        await pi.emit("context", { messages: [{ role: "user", content: "a" }] }),
-      );
-      expect(turn1?.messages?.filter(isInstructionsMessage).length).toBe(1);
-
-      // Turn 2: before_agent_start clears the per-turn set (and appends the
-      // note, but does NOT inject rules into the system prompt).
-      const turn2 = asHookResult(await pi.emit("before_agent_start", { systemPrompt: "BASE" }));
-      expect(turn2?.systemPrompt).toContain("contextual");
-      expect(turn2?.systemPrompt).not.toContain("BE SECURE");
-
-      // Same matching path, but conversation grew only 1 token since the last
-      // injection → gap (0) < tokenGap (1000), so no re-injection.
+      // New turn, same matching path, small conversation: no re-injection.
+      await pi.emit("before_agent_start", { systemPrompt: "BASE" });
       const ctxSmall = asHookResult(
         await pi.emit("context", { messages: [{ role: "user", content: "b" }] }),
       );
       expect(ctxSmall).toBeUndefined();
 
-      // Conversation grows past the token gap (content "x"*5000 → ceil(5000/4)
-      // = 1250 tokens; 1250 - 1 >= 1000) → the rule re-injects this turn.
+      // Growth alone (even +70K tokens) never re-injects.
       const ctxGrown = asHookResult(
-        await pi.emit("context", { messages: [{ role: "user", content: "x".repeat(5000) }] }),
+        await pi.emit("context", { messages: [{ role: "user", content: "x".repeat(280000) }] }),
       );
-      expect(ctxGrown?.messages?.filter(isInstructionsMessage).length).toBe(1);
+      expect(ctxGrown).toBeUndefined();
+
+      // Compaction: conversation drops >30% and >5K tokens → re-inject.
+      const ctxCompacted = asHookResult(
+        await pi.emit("context", { messages: [{ role: "user", content: "short again" }] }),
+      );
+      expect(ctxCompacted?.messages?.filter(isInstructionsMessage).length).toBe(1);
     });
   });
 

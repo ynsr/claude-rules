@@ -16,6 +16,8 @@ import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, dirname, relative, sep } from "node:path";
+import { discoverAgents, matchAgent } from "../agents.ts";
+import type { AgentDoc } from "../agents.ts";
 import { findRepoRoot } from "../discover.ts";
 import { parseRule } from "../rule.ts";
 import type { Rule } from "../rule.ts";
@@ -25,10 +27,7 @@ import { formatRules } from "../format.ts";
 // ── Constants ───────────────────────────────────────────────────────────────
 
 /** Tools whose arguments carry a `file_path` field. Matches DSH's tool naming. */
-const FILE_TOUCH_TOOLS = new Set(["read", "write", "edit"]);
-
-/** Subdirectories to scan for rule files, in order of precedence. */
-const RULE_DIRS = [".dsh", ".claude"];
+const FILE_TOUCH_TOOLS: Record<string, boolean> = { read: true, write: true, edit: true };
 
 // ── Logger ──────────────────────────────────────────────────────────────────
 
@@ -209,7 +208,7 @@ export interface DshRulesConfig {
  *
  * Usage (cordis.yml):
  *   - id: dsh-rules
- *     name: '/path/to/claude-rules/src/dsh/plugin.ts'
+ *     name: '/path/to/claude-rules-for-omp/src/dsh/plugin.ts'
  *     config:
  *       maxBytes: 65536
  *       logLevel: debug
@@ -223,42 +222,72 @@ export function apply(ctx: Context, config: DshRulesConfig = {}): void {
   log.info(`config: maxBytes=${maxBytes}, logLevel=${config.logLevel ?? "info"}, logPath=${config.logPath ?? "/tmp/dsh-rules.log"}`);
 
   let rules: Rule[] = [];
+  let agents: AgentDoc[] = [];
   let repoRoot = "";
+  let sessionCwd = "";
   const touched = new Set<string>();
-  // Per-agent session state: rules already injected this turn
-  const sessionState = new Map<string, {
-    injectedThisTurn: Set<string>;
-  }>();
-
-  // ── helpers ──
+  const formattedCache = new Map<string, string>();
+  // Per-agent session state: inject-once keys + token sizes for compaction.
+  const sessionState = new Map<string, { injectedEver: Set<string>; prevTokens: number }>();
 
   function getSessionState(sessionId: string) {
     let state = sessionState.get(sessionId);
     if (!state) {
-      state = { injectedThisTurn: new Set() };
+      state = { injectedEver: new Set(), prevTokens: 0 };
       sessionState.set(sessionId, state);
       log.debug(`getSessionState: created new state for session ${sessionId}`);
     }
     return state;
   }
 
+  function itemKey(file: string, mtimeMs: number): string {
+    return `${file}@${mtimeMs}`;
+  }
+
+  function estimateTokensLocal(content: unknown): number {
+    if (typeof content === "string") return Math.ceil(content.length / 4);
+    if (Array.isArray(content)) {
+      let chars = 0;
+      for (const c of content) {
+        if (c !== null && typeof c === "object" && "type" in c && (c as { type?: unknown }).type === "text" && "text" in c) {
+          const t = (c as { text?: unknown }).text;
+          if (typeof t === "string") chars += t.length;
+        }
+      }
+      return Math.ceil(chars / 4);
+    }
+    return 0;
+  }
+
   // ── discover rules on the first file touch ──
 
   let discovered = false;
 
-  function ensureDiscovered(sessionCwd: string) {
+  function ensureDiscovered(cwd: string) {
     if (discovered) {
       log.debug("ensureDiscovered: already discovered, skipping");
       return;
     }
     discovered = true;
-    repoRoot = findRepoRoot(sessionCwd);
-    log.info(`ensureDiscovered: repoRoot=${repoRoot}, sessionCwd=${sessionCwd}`);
-    rules = discoverDshRules(sessionCwd, log);
-    log.info(`ensureDiscovered: ${rules.length} rules loaded`);
+    repoRoot = findRepoRoot(cwd);
+    sessionCwd = cwd;
+    log.info(`ensureDiscovered: repoRoot=${repoRoot}, sessionCwd=${cwd}`);
+    rules = discoverDshRules(cwd, log);
+    agents = discoverAgents(cwd);
+    log.info(`ensureDiscovered: ${rules.length} rules + ${agents.length} AGENTS.md loaded`);
   }
 
-  // Clear per-turn dedup sets at the start of each step.
+  function rediscoverOnCompaction() {
+    clearDshRuleCache();
+    rules = discoverDshRules(sessionCwd, log);
+    agents = discoverAgents(sessionCwd);
+    formattedCache.clear();
+    for (const state of sessionState.values()) state.injectedEver.clear();
+    log.info(`compaction: re-discovered ${rules.length} rules + ${agents.length} AGENTS.md, cleared inject-once state`);
+  }
+
+  // Clear nothing per turn: injection is once-per-session. `step/start` only
+  // ensures per-session state exists for the compaction detector.
   log.info("Registering session/event handler…");
   const disposer1 = ctx.on("session/event", (...args: unknown[]) => {
     const session = args[0] as { id: string } | undefined;
@@ -269,13 +298,17 @@ export function apply(ctx: Context, config: DshRulesConfig = {}): void {
     }
     log.debug(`session/event: session=${session.id}, event.type=${event.type}`);
     if (event.type === "step/start") {
-      const state = sessionState.get(session.id);
-      if (state) {
-        state.injectedThisTurn.clear();
-        log.debug(`session/event: cleared injectedThisTurn for session ${session.id}`);
-      } else {
-        log.debug(`session/event: no state for session ${session.id} (not yet touched by tools/result)`);
-      }
+      getSessionState(session.id);
+      log.debug(`session/event: ensured state for session ${session.id}`);
+    }
+    // Explicit compaction signal from the harness, when present. DSH core
+    // (`dsh-compaction` / `dsh-hook-protocol`) pairs hooks rather than
+    // emitting cordis `session/event` types, and the invariant package names
+    // no canonical event string — so match defensively on any signal whose
+    // type mentions compact/summarize/prune.
+    if (/compact|summar|prune/i.test(event.type)) {
+      log.info(`session/event: compaction signal ${event.type} for session ${session.id}`);
+      rediscoverOnCompaction();
     }
   });
   log.info(`session/event handler registered, disposer=${typeof disposer1}`);
@@ -301,7 +334,7 @@ export function apply(ctx: Context, config: DshRulesConfig = {}): void {
       log.debug(`tools/result: skipped — error result`);
       return;
     }
-    if (!FILE_TOUCH_TOOLS.has(exec.name)) {
+    if (!FILE_TOUCH_TOOLS[exec.name]) {
       log.debug(`tools/result: skipped — not a file-touch tool (${exec.name})`);
       return;
     }
@@ -314,64 +347,75 @@ export function apply(ctx: Context, config: DshRulesConfig = {}): void {
     if (exec.agent) {
       log.info(`tools/result: processing file_path="${filePath}" for session ${exec.agent.session.id}`);
 
-      const sessionCwd = exec.agent.session.header?.cwd ?? process.cwd();
-      log.debug(`tools/result: session cwd="${sessionCwd}"`);
-      ensureDiscovered(sessionCwd);
+      const cwd = exec.agent.session.header?.cwd ?? process.cwd();
+      log.debug(`tools/result: session cwd="${cwd}"`);
+      ensureDiscovered(cwd);
 
       const norm = normalizePath(filePath.trim(), repoRoot);
       touched.add(norm);
       log.debug(`tools/result: normalized path="${norm}", touched.size=${touched.size}`);
 
-      // Match rules against all touched paths
-      const matched = rules.filter((r) => matchRule(r, [...touched]));
-      log.info(`tools/result: ${matched.length} rules matched out of ${rules.length} total`);
-      if (matched.length === 0) {
-        log.debug("tools/result: no rules matched, returning");
-        return;
-      }
-
       const sessionId = exec.agent.session.id;
       const state = getSessionState(sessionId);
 
-      // Filter out rules already injected this turn
-      const fresh = matched.filter((r) => {
-        const key = `${r.file}@${r.mtimeMs}`;
-        if (state.injectedThisTurn.has(key)) {
-          log.debug(`tools/result: already injected this turn: ${r.name} (${key})`);
-          return false;
-        }
-        return true;
-      });
+      // Compaction heuristic: estimate conversation size from the touched
+      // history window is unavailable here, so track cumulative touched-path
+      // chars as a monotonic proxy is wrong — instead rely on explicit
+      // compaction events above. Growth alone never clears inject-once state.
 
-      log.info(`tools/result: ${fresh.length} fresh rules out of ${matched.length} matched`);
-      if (fresh.length === 0) {
-        log.debug("tools/result: all matched rules already injected this turn, returning");
+      // Match rules + nested AGENTS.md against all touched paths
+      const touchedList = [...touched];
+      const matchedRules = rules.filter((r) => !state.injectedEver.has(itemKey(r.file, r.mtimeMs)) && matchRule(r, touchedList));
+      const matchedAgents = agents.filter((a) => !state.injectedEver.has(itemKey(a.file, a.mtimeMs)) && matchAgent(a, touchedList, repoRoot));
+      log.info(`tools/result: ${matchedRules.length} fresh rules + ${matchedAgents.length} fresh AGENTS.md out of ${rules.length} rules`);
+      if (matchedRules.length === 0 && matchedAgents.length === 0) {
+        log.debug("tools/result: nothing fresh, returning");
         return;
       }
 
-      // Mark as injected this turn
-      for (const r of fresh) {
-        const key = `${r.file}@${r.mtimeMs}`;
-        state.injectedThisTurn.add(key);
-        log.debug(`tools/result: marked injected: ${r.name} (${key})`);
-      }
+      // Mark as injected this session (inject-once; growth never re-injects)
+      for (const r of matchedRules) state.injectedEver.add(itemKey(r.file, r.mtimeMs));
+      for (const a of matchedAgents) state.injectedEver.add(itemKey(a.file, a.mtimeMs));
 
-      // Format and inject as a user-role message
-      let text = formatDshRules(fresh);
+      // Format: ancestors first, leaf last; rules after AGENTS.md.
+      const sections: string[] = [];
+      for (const a of matchedAgents) {
+        const key = itemKey(a.file, a.mtimeMs);
+        let body = formattedCache.get(key);
+        if (body === undefined) {
+          body = `Contents of ${a.file}:\n\n${a.body.trim()}\n`;
+          formattedCache.set(key, body);
+        }
+        sections.push(body);
+      }
+      if (matchedRules.length > 0) {
+        const key = `rules@${matchedRules.map((r) => itemKey(r.file, r.mtimeMs)).join("+")}`;
+        let body = formattedCache.get(key);
+        if (body === undefined) {
+          body = formatRules(matchedRules);
+          formattedCache.set(key, body);
+        }
+        sections.push(body);
+      }
+      let text = `<system-reminder>\nPath-scoped rules matched by files the session touched:\n\n${sections.join("\n---\n\n").trimEnd()}\n</system-reminder>`;
+      void estimateTokensLocal;
       log.debug(`tools/result: formatted text length=${Buffer.byteLength(text, "utf8")} bytes, maxBytes=${maxBytes}`);
 
       // Guard against the byte budget — truncate by dropping rules if needed
       if (Buffer.byteLength(text, "utf8") > maxBytes) {
         log.warn(`tools/result: formatted text exceeds maxBytes (${Buffer.byteLength(text, "utf8")} > ${maxBytes}), truncating`);
-        let remaining = fresh;
+        let remaining = matchedRules;
         while (remaining.length > 0 && Buffer.byteLength(formatDshRules(remaining), "utf8") > maxBytes) {
           remaining = remaining.slice(0, -1);
         }
-        if (remaining.length === 0) {
+        if (remaining.length === 0 && matchedAgents.length === 0) {
           log.warn("tools/result: all rules dropped after truncation, nothing to inject");
           return;
         }
-        text = formatDshRules(remaining);
+        const kept: string[] = [];
+        for (const a of matchedAgents) kept.push(`Contents of ${a.file}:\n\n${a.body.trim()}\n`);
+        if (remaining.length > 0) kept.push(formatRules(remaining));
+        text = `<system-reminder>\nPath-scoped rules matched by files the session touched:\n\n${kept.join("\n---\n\n").trimEnd()}\n</system-reminder>`;
         log.info(`tools/result: truncated to ${remaining.length} rules (${Buffer.byteLength(text, "utf8")} bytes)`);
       }
 
@@ -380,7 +424,7 @@ export function apply(ctx: Context, config: DshRulesConfig = {}): void {
           content: [{ type: "text", text }],
           source: { kind: "path-scoped-rules", form: "instructions" },
         }));
-        log.info(`tools/result: successfully injected ${fresh.length} rules for session ${sessionId}`);
+        log.info(`tools/result: successfully injected ${matchedRules.length} rules + ${matchedAgents.length} AGENTS.md for session ${sessionId}`);
       } catch (err) {
         log.error(`tools/result: failed to inject message: ${String(err)}`);
       }

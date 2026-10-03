@@ -35,4 +35,5 @@ Thumbs.db
 
 # Test / coverage
 coverage/
-/claude-rules.ts
+/claude-rules-for-omp.ts
+/dsh-rules.ts

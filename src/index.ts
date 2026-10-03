@@ -1,25 +1,22 @@
-import {estimateTokens} from "@earendil-works/pi-coding-agent";
-import type {ContextEvent, ExtensionAPI} from "@earendil-works/pi-coding-agent";
-import {discoverRules, findRepoRoot} from "./discover";
-import {matchRule, normalizePath} from "./match";
-import {formatRules} from "./format";
-import type {Rule} from "./rule";
+import type { ContextEvent, ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { discoverAgents, matchAgent } from "./agents.ts";
+import type { AgentDoc } from "./agents.ts";
+import { clearRuleCache, discoverRules, findRepoRoot } from "./discover.ts";
+import { matchRule, normalizePath } from "./match.ts";
+import { formatRules } from "./format.ts";
+import type { Rule } from "./rule.ts";
 
 const PATH_TOOLS = new Set(["read", "edit", "write", "grep", "find", "ls"]);
 const GLOBS_TOOLS = new Set(["glob"]);
 
 /**
- * Token-gap re-injection threshold. A matched rule is re-injected only when the
- * estimated conversation has grown by more than this many tokens since its last
- * injection, so rules stay in the model's active attention window without being
- * resent on every same-path touch. X = min(claimedWindow * 0.25, CAP). The cap
- * guards against reseller/aggregator context windows that over-claim the
- * nominal window; the fallback assumes a 250K floor (the smallest window the
- * user runs), so 70K is a safe default when the window is unknown.
+ * Compaction detector. Rules and nested AGENTS.md docs inject exactly once per
+ * session; re-discovery + re-injection happens only when the estimated
+ * conversation size drops sharply (>30% and >5K tokens, to reject jitter),
+ * which signals a compaction/summarization. Growth alone never re-injects.
  */
-const TOKEN_GAP_CAP = 70_000;
-const TOKEN_GAP_FRACTION = 0.25;
-const TOKEN_GAP_FALLBACK = 70_000;
+const COMPACTION_RATIO = 0.7;
+const COMPACTION_MIN_TOKENS = 5000;
 
 /**
  * Static note appended to the system prompt at the start of each agent turn so
@@ -45,10 +42,10 @@ function isOmp(): boolean {
   return /(?:^|[\\/])\.omp(?:[\\/]|$)/.test(agentDir);
 }
 
-function dedupKey(r: Rule): string {
-  // Absolute path uniquely identifies a discovered rule; include mtime so an
+function contentKey(file: string, mtimeMs: number): string {
+  // Absolute path uniquely identifies a discovered item; include mtime so an
   // on-disk edit mid-session that triggers rediscovery isn't double-counted.
-  return `${r.file}@${r.mtimeMs}`;
+  return `${file}@${mtimeMs}`;
 }
 
 // Diagnostics. The structured logger (ctx.logger → ~/.omp/logs/omp.*.log) is
@@ -72,13 +69,13 @@ function adoptLogger(l: { warn(m: string, c?: Record<string, unknown>): void } |
       });
       detail = `${m} (${parts.join(" ")})`;
     }
-    // if (_logger) _logger.warn(`\n[claude-rules] ${detail}`);
-    // else console.log(`\n[claude-rules] ${detail}`);
+    // if (_logger) _logger.warn(`\n[claude-rules-for-omp] ${detail}`);
+    // else console.log(`\n[claude-rules-for-omp] ${detail}`);
   };
 }
 
 function loadLog(m: string): void {
-  // console.log(`\n[claude-rules] ${m}`);
+  // console.log(`\n[claude-rules-for-omp] ${m}`);
 }
 
 // Only the glob tool address targets via `pattern`; the path-based tools
@@ -132,21 +129,21 @@ function contentText(content: unknown): string {
   return "";
 }
 
-export default function claudeRules(pi: ExtensionAPI): void {
+export default function claudeRulesForOmp(pi: ExtensionAPI): void {
   let rules: Rule[] = [];
+  let agents: AgentDoc[] = [];
   let repoRoot = "";
+  let sessionCwd = "";
   const touched = new Set<string>();
-  // Rules already injected this turn (via the omp `context` event into a
-  // system message). Cleared at the top of before_agent_start, which fires once
-  // per user prompt before the tool loop. Prevents a rule from being sent twice
-  // in one turn, while still re-injecting on later turns.
-  const injectedThisTurn = new Set<string>();
-  // Estimated conversation tokens at each rule's last injection, keyed by
-  // dedupKey. Persists across turns so a rule is re-injected only after the
-  // conversation has grown past the token gap (freshness guard).
-  const lastInjectedTokens = new Map<string, number>();
-  // Token-gap threshold for this session, derived from the claimed window.
-  let tokenGap = TOKEN_GAP_FALLBACK;
+  // Items already injected this session. Cleared only on session_start and on
+  // detected compaction — never on growth, never per turn.
+  const injectedEver = new Set<string>();
+  // Estimated conversation tokens at the last context event; used only to
+  // detect compaction (sharp drops). Local chars/4 heuristic — no dependency.
+  let prevTokens = 0;
+  // Formatted bodies cached per content key so re-injection after compaction
+  // reuses the string without re-reading or re-formatting.
+  const formattedCache = new Map<string, string>();
 
   loadLog(`extension loaded; omp=${isOmp()}`);
 
@@ -155,57 +152,49 @@ export default function claudeRules(pi: ExtensionAPI): void {
     // repo-relative rule globs (e.g. src/**/*.ts) match even when the session
     // starts from a subdirectory of the repository.
     repoRoot = findRepoRoot(ctx.cwd);
+    sessionCwd = ctx.cwd;
     rules = await discoverRules(ctx.cwd);
+    agents = discoverAgents(ctx.cwd);
     touched.clear();
-    injectedThisTurn.clear();
-    lastInjectedTokens.clear();
-    // X = min(claimedWindow * 0.25, CAP), fallback when window unknown. The
-    // claimed window is the reliability risk (resellers over-claim), so we cap
-    // it and otherwise trust the fraction.
-    const claimed = ctx.model?.contextWindow;
-    tokenGap = claimed ? Math.min(claimed * TOKEN_GAP_FRACTION, TOKEN_GAP_CAP) : TOKEN_GAP_FALLBACK;
+    injectedEver.clear();
+    formattedCache.clear();
+    prevTokens = 0;
     // ctx.logger may be absent (e.g. pi mocks in tests); adopter falls back to console.
     adoptLogger(ctx.logger);
     log("session_start", {
       cwd: ctx.cwd,
       repoRoot,
-      claimedWindow: claimed ?? null,
-      tokenGap,
       discovered: rules.length,
+      agentDocs: agents.length,
       rules: rules.map((r) => `${r.name}(${r.paths.length}p${r.negated.length}n${r.alwaysApply ? ",always" : ""})`).join(" "),
     });
   });
 
   pi.on("tool_call", async (event) => {
-    const name = event.toolName;
-    const input = event.input as Record<string, unknown>;
+    const toolName = event.toolName;
+    const name = typeof toolName === "string" ? toolName : "";
+    const evtInput = event.input;
+    const input = evtInput !== null && typeof evtInput === "object" && !Array.isArray(evtInput) ? (evtInput as Record<string, unknown>) : undefined;
     if (!PATH_TOOLS.has(name) && !GLOBS_TOOLS.has(name)) {
-      log("tool_call skip (not path tool)", {name});
+      log("tool_call skip (not path tool)", { name });
       return;
     }
     const p = capturePath(name, input);
     if (p === undefined) {
-      log("tool_call skip (no path)", {name, input: JSON.stringify(input)});
+      log("tool_call skip (no path)", { name });
       return;
     }
     const norm = normalizePath(p, repoRoot);
     touched.add(norm);
-    log("tool_call", {name, raw: p, normalized: norm, repoRoot});
+    log("tool_call", { name, raw: p, normalized: norm, repoRoot });
   });
 
   // Fires once per user prompt, before the tool loop runs any tool calls.
-  // We do NOT bulk-inject rules here — that is what previously dumped every
-  // (always-apply and matched) rule into the system prompt. Pure progressive
-  // disclosure is handled by the omp `context` handler below, which injects a
-  // matching rule only after a tool_call touches a matching path. So the only
-  // thing this hook does is (a) reset the per-turn dedup set and (b) append
-  // the contextual-guidance note to the system prompt at the start of the turn.
+  // Only appends the contextual-guidance note and records `@path`-referenced
+  // files as touched so path-scoped rules match before any tool_call reads
+  // the file. Never injects rules here (progressive disclosure is
+  // context-only) and never resets injection state.
   pi.on("before_agent_start", async (event) => {
-    injectedThisTurn.clear();
-    // Files referenced in the prompt via `@path/to/file.ext` (or inline
-    // `<file path="…">` blocks) count as touched, so path-scoped rules match
-    // even before any tool_call reads the file. omp also injects the file
-    // content as a separate message — handled in the context handler below.
     if (typeof event.prompt === "string") {
       for (const raw of extractPromptPaths(event.prompt)) {
         touched.add(normalizePath(raw, repoRoot));
@@ -217,18 +206,15 @@ export default function claudeRules(pi: ExtensionAPI): void {
   });
 
   // omp-only mid-turn injection. The `context` event fires before every model
-  // step (agent-session transformContext → emitContext), so once a tool_call
-  // has recorded a matching path, the SAME turn's next step receives the rule.
-  // We inject as user-role `<instructions>` content (appended after the tool
-  // result that matched), matching how Claude Code delivers rule content
-  // mid-session. Base Pi's `defaultConvertToLlm` filters system-role messages
-  // out, so this is guarded to omp only; Pi gets no automatic injection.
-  if (isOmp() || 1) {
-    pi.on("context", (event: ContextEvent) => {
+  // step, so once a tool_call has recorded a matching path, the SAME turn's
+  // next step receives the rule. Injected as user-role `<instructions>`
+  // content appended after the tool result. Base Pi's `defaultConvertToLlm`
+  // filters system-role messages out, so this is guarded to omp only.
+  if (isOmp()) {
+    pi.on("context", async (event: ContextEvent) => {
       // omp expands `@path` prompt mentions into a separate user message whose
       // content is a `<file path="…">` block. Capture those injected paths so
       // the file matches path-scoped rules even though no tool_call touched it.
-      // scanned every step but `touched` is a Set, so this is idempotent.
       for (const msg of event.messages) {
         // AgentMessage is a union (incl. BashExecutionMessage with no
         // `content`); narrow with `in` so the access is checked.
@@ -237,38 +223,55 @@ export default function claudeRules(pi: ExtensionAPI): void {
           touched.add(normalizePath(raw, repoRoot));
         }
       }
-      if (rules.length === 0) {
+      const currentTokens = event.messages.reduce((acc, m) => acc + estimateTokensLocal(m), 0);
+      // Compaction: sharp token drop since the last step. Re-discover from
+      // disk (mtime cache makes unchanged files free) and allow re-injection.
+      if (prevTokens > 0 && currentTokens < prevTokens * COMPACTION_RATIO && prevTokens - currentTokens >= COMPACTION_MIN_TOKENS) {
+        clearRuleCache();
+        rules = await discoverRules(sessionCwd);
+        agents = discoverAgents(sessionCwd);
+        injectedEver.clear();
+        formattedCache.clear();
+        log("context compaction detected", { prevTokens, currentTokens, rules: rules.length, agentDocs: agents.length });
+      }
+      prevTokens = currentTokens;
+      if (rules.length === 0 && agents.length === 0) {
         log("context no rules to match");
         return;
       }
-      // Current estimated conversation tokens; char/4 heuristic via
-      // estimateTokens. Computed once per event, only when there's a candidate.
-      const currentTokens = event.messages.reduce(
-        (acc, m) => acc + estimateTokens(m),
-        0,
-      );
-      const matched = rules.filter((r) => {
-        const key = dedupKey(r);
-        if (injectedThisTurn.has(key)) return false;
-        if (!matchRule(r, [...touched])) return false;
-        // Freshness guard: re-inject only if the conversation has grown past
-        // the token gap since this rule's last injection (or never injected).
-        const last = lastInjectedTokens.get(key);
-        return last === undefined || currentTokens - last >= tokenGap;
-      });
+      const touchedList = [...touched];
+      const freshRules = rules.filter((r) => !injectedEver.has(contentKey(r.file, r.mtimeMs)) && matchRule(r, touchedList));
+      const freshAgents = agents.filter((a) => !injectedEver.has(contentKey(a.file, a.mtimeMs)) && matchAgent(a, touchedList, repoRoot));
       log("context", {
         touched: touched.size,
         currentTokens,
-        tokenGap,
-        matched: matched.map((r) => r.name).join(",") || "(none)",
-        injecting: matched.length > 0,
+        matched: freshRules.map((r) => r.name).join(",") || "(none)",
+        agentDocs: freshAgents.map((a) => a.file).join(",") || "(none)",
+        injecting: freshRules.length + freshAgents.length > 0,
         totalMsgs: event.messages.length,
       });
-      if (matched.length === 0) return;
-      for (const r of matched) {
-        const key = dedupKey(r);
-        injectedThisTurn.add(key);
-        lastInjectedTokens.set(key, currentTokens);
+      if (freshRules.length === 0 && freshAgents.length === 0) return;
+      for (const r of freshRules) injectedEver.add(contentKey(r.file, r.mtimeMs));
+      for (const a of freshAgents) injectedEver.add(contentKey(a.file, a.mtimeMs));
+      const sections: string[] = [];
+      // Ancestors first, leaf last (agents already root → leaf); rules after.
+      for (const a of freshAgents) {
+        const key = contentKey(a.file, a.mtimeMs);
+        let body = formattedCache.get(key);
+        if (body === undefined) {
+          body = `Contents of ${a.file}:\n\n${a.body.trim()}\n`;
+          formattedCache.set(key, body);
+        }
+        sections.push(body);
+      }
+      if (freshRules.length > 0) {
+        const key = `rules@${freshRules.map((r) => contentKey(r.file, r.mtimeMs)).join("+")}`;
+        let body = formattedCache.get(key);
+        if (body === undefined) {
+          body = formatRules(freshRules);
+          formattedCache.set(key, body);
+        }
+        sections.push(body);
       }
       // UserMessage isn't exported from the public API; the injected role is a
       // user-role `<instructions>` block appended after the tool result so the
@@ -278,10 +281,23 @@ export default function claudeRules(pi: ExtensionAPI): void {
           ...event.messages,
           {
             role: "user",
-            content: `<instructions>\n${formatRules(matched)}\n</instructions>`,
+            content: `<instructions>\n${sections.join("\n---\n\n")}\n</instructions>`,
           } as never,
         ],
       };
     });
   }
 }
+
+/**
+ * Local token estimate (chars/4 heuristic). Replaces the
+ * `@earendil-works/pi-coding-agent` value import so the omp bundle ships zero
+ * runtime dependencies; the host resolves that package only for types.
+ */
+function estimateTokensLocal(m: unknown): number {
+  if (!m || typeof m !== "object" || !("content" in m)) return 0;
+  return Math.ceil(contentText(m.content).length / 4);
+}
+
+// Back-compat alias: existing installs reference the `claudeRules` default.
+export { claudeRulesForOmp as claudeRules };

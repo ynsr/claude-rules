@@ -23,7 +23,7 @@ The extension is event-driven, registering handlers on the `ExtensionAPI`:
 
 | Path | Purpose |
 |---|---|
-| `src/` | Extension source. `index.ts` (entry/factory), `discover.ts` (rule discovery + cache), `match.ts` (path match), `format.ts` (rendering), `rule.ts` (Rule type + frontmatter parsing), `glob.ts` (dependency-free glob matcher) |
+| `src/` | Extension source. `index.ts` (entry/factory `claudeRulesForOmp`), `discover.ts` (rule discovery + cache), `agents.ts` (nested AGENTS.md discovery + scope match), `match.ts` (path match), `format.ts` (rendering), `rule.ts` (Rule type + frontmatter parsing), `glob.ts` (dependency-free glob matcher) |
 | `test/` | `bun:test` unit + integration tests, one file per module plus `context.test.ts` (integration) |
 | `.claude/rules/` | Dogfood rules shipped with the repo (`ts-style.md`, `api-design.md`, `security.md`) — they exercise the extension's own `paths` matching |
 | `docs/superpowers/plans/` | Implementation plan (historical artifact; its architecture section is stale — see below) |
@@ -31,10 +31,11 @@ The extension is event-driven, registering handlers on the `ExtensionAPI`:
 ## Development Commands
 
 ```bash
-bun test                # run the test suite (bun:test)
-bun x tsc --noEmit      # typecheck (strict, noEmit; not scripted in package.json)
-bun build src/index.ts --target=bun --outfile=claude-rules.ts   # build deployable bundle
-cp claude-rules.ts ~/.omp/agent/extensions/   # install as drop-in copy (Option B)
+bun test                          # run the test suite (bun:test)
+bun x tsc --noEmit                # typecheck (strict, noEmit; not scripted in package.json)
+bun run build:omp                 # → claude-rules-for-omp.ts (external: pi-coding-agent, types-only)
+bun run build:dsh                 # → dsh-rules.ts (external: cordis, dsh-llm)
+cp claude-rules-for-omp.ts ~/.omp/agent/extensions/   # install as drop-in copy (Option B)
 ```
 
 - Install Option A (recommended): reference `src/index.ts` directly via `config.yml` `extensions:` — no bundle needed; relative imports resolve in-repo.
@@ -42,11 +43,12 @@ cp claude-rules.ts ~/.omp/agent/extensions/   # install as drop-in copy (Option 
 
 ## Code Conventions & Common Patterns
 
-- **ESM** (`"type": "module"`), factory-export style: `export default function claudeRules(pi: ExtensionAPI)`.
-- **Type-only imports** from `@earendil-works/pi-coding-agent` where possible (stripped at build); value imports like `estimateTokens` are the exception.
+- **ESM** (`"type": "module"`), factory-export style: `export default function claudeRulesForOmp(pi: ExtensionAPI)` (`claudeRules` alias kept for existing installs).
+- **Type-only imports** from `@earendil-works/pi-coding-agent` (real dependency, `^0.84.1`, but types-only at runtime — the omp bundle externalizes it and uses a local chars/4 token estimate). DSH imports `@deepseek-ai/cordis`/`@deepseek-ai/dsh-llm` as host-provided externals (never bundled).
 - **Never throw in parsers.** `parseFrontmatter`, `stripFrontmatter`, `globToRegExp` all degrade gracefully on malformed input (return empty metadata / literals). No empty try/catch; unreadable files skip via guarded try/catch.
 - **Dependency-free primitives.** Glob translation and YAML-frontmatter parsing are hand-rolled in `glob.ts` / `rule.ts` — extend them in place rather than adding libraries.
-- **Data structures:** `Set` for dynamic membership / runtime collections (`touched`, `injectedThisTurn`); `Map` for keyed runtime state (`lastInjectedTokens`); `Record` for small static lookup tables.
+- **AGENTS.md scope** (in `agents.ts`): `discoverAgents` walks repoRoot → cwd, returns root→leaf docs, skips the file at cwd (harness-owned); `matchAgent` checks touched path under `scopeDir`; mtime-keyed cache via `clearAgentCache`.
+- **Inject-once + compaction:** `injectedEver` set per session; growth never re-injects; re-discovery + clear only on token-drop compaction (>30% and >5K tokens; DSH also honors explicit compaction events). Cached formatted bodies in `formattedCache`.
 - **Per-path negation semantics** (in `matchRule`): a touched path must match a positive glob AND not be hidden by a negated glob; other negated touched paths don't disqualify.
 - **`alwaysApply`** = `paths.length === 0` (after `!`-prefixed entries are split into `negated`).
 - **omp detection** (`isOmp`): check `OMPCODE === "1"` fast path, then scan `PI_CODING_AGENT_DIR`/`PI_CONFIG_DIR` for an `.omp` segment. `OMPCODE` alone is unreliable (set only in spawned shells, not the extension host).
@@ -55,9 +57,9 @@ cp claude-rules.ts ~/.omp/agent/extensions/   # install as drop-in copy (Option 
 
 ## Important Files
 
-- `src/index.ts` — entry point + `claudeRules` factory; all event wiring; constants `TOKEN_GAP_CAP`/`TOKEN_GAP_FRACTION`/`TOKEN_GAP_FALLBACK`, `CONTEXT_NOTE`; helpers `isOmp`, `dedupKey`, `adoptLogger`, `capturePath`.
+- `src/index.ts` — entry point + `claudeRulesForOmp` factory; all event wiring; constants `COMPACTION_RATIO`/`COMPACTION_MIN_TOKENS`, `CONTEXT_NOTE`; helpers `isOmp`, `contentKey`, `adoptLogger`, `capturePath`, `estimateTokensLocal`.
 - `src/rule.ts` — `Rule` interface and frontmatter parsing; the source of truth for rule shape.
-- `src/discover.ts` — `findRepoRoot`, `discoverRules` (cwd→repo-root walk + `~/.claude/rules`, more-local wins on name collisions, mtime-keyed cache), `clearRuleCache`.
+- `src/agents.ts` — `AgentDoc`, `discoverAgents` (root→leaf, skips cwd file), `matchAgent`, `clearAgentCache`.
 - `src/match.ts` — `normalizePath`, `matchRule` (per-path negation).
 - `src/glob.ts` — `globToRegExp`, `matchGlob` (segments, `**`, `?`, `{a,b}`, `[abc]`/`[a-z]`).
 - `src/format.ts` — `formatRules` (`Contents of <absolute path>:` heading per rule).
@@ -68,18 +70,17 @@ cp claude-rules.ts ~/.omp/agent/extensions/   # install as drop-in copy (Option 
 - **Runtime:** Bun (required — `bun:test`, `Bun.env`, `bun build`). Not Node.
 - **Package manager:** `bun` (lockfile `bun.lock`).
 - **Typecheck:** `bun x tsc --noEmit` (strict, `types: ["bun"]`, `moduleResolution: bundler`).
-- **Extension type source:** `@earendil-works/pi-coding-agent` (dev dependency, `^0.84.1`).
-- **Deploy artifact:** root `claude-rules.ts` is a gitignored bun build output, not source.
+- **Extension type source:** `@earendil-works/pi-coding-agent` (dependency, `^0.84.1`, types-only at runtime).
+- **Deploy artifacts:** `claude-rules-for-omp.ts` (omp) and `dsh-rules.ts` (DSH) are gitignored bun build outputs, not source.
 
 ## Testing & QA
 
 - **Framework:** `bun:test`; run with `bun test`. No coverage tooling configured.
-- **Structure:** pure-unit tests per module (`glob`, `rule`, `match`, `format`, `discover`, `index`) test imported functions directly with hand-built `Rule` fixtures; `context.test.ts` is the only integration test — it instantiates `claudeRules` and drives the full event lifecycle through a mock pi.
+- **Structure:** pure-unit tests per module (`glob`, `rule`, `match`, `format`, `discover`, `agents`, `index`) test imported functions directly with hand-built fixtures; `context.test.ts` is the only integration test — it instantiates `claudeRulesForOmp` and drives the full event lifecycle through a mock pi.
 - **Mock pi** (`makePi`): `Map<string, Handler[]>` registry; sequential awaited `emit` returning the last handler result. Events must fire in order `session_start → before_agent_start → tool_call → context`.
 - **`withOmp(omp, fn)`** toggles BOTH `Bun.env.OMPCODE` and `PI_CODING_AGENT_DIR` (setting only `OMPCODE` would leave a real host-inherited `.omp` dir making `isOmp()` true in the non-omp case).
-- **Token-gap test:** mock `model: { contextWindow: 4000 }` → gap = 1000 tokens; chars/4 estimate (5000 chars = 1250 tokens triggers re-inject; 1 token does not).
-- **Conventions:** `mkdtempSync("claude-rules-")` per test in `beforeEach`, `rmSync` in `afterAll`; `discover.test.ts` calls `clearRuleCache()` in `beforeEach`.
-- **When changing behavior,** update the matching `context.test.ts` assertions — the injected `<instructions>` message must be appended last, start/end with the tags, and lead with `Contents of <absolute path>:`.
+- **Compaction test:** inject once → growth (even +70K tokens) injects nothing → token drop >30% re-injects.
+- **Conventions:** `mkdtempSync("claude-rules-for-omp-")` per test in `beforeEach`, `rmSync` in `afterAll`; `discover.test.ts` calls `clearRuleCache()` in `beforeEach`.
 
 ## DSH Profile Patch Format
 

@@ -156,6 +156,38 @@ describe("context-event mid-turn injection (omp)", () => {
     });
   });
 
+  test("appends matching rules to the read tool_result (guaranteed-delivery path)", async () => {
+    await withOmp(true, async () => {
+      const repo = makeRepo();
+      const pi = makePi();
+      claudeRules(pi as unknown as ExtensionAPI);
+      await pi.emit("session_start", {}, { cwd: repo, hasUI: false, ui: {} });
+      await pi.emit("before_agent_start", { systemPrompt: "BASE", prompt: "summarize the file" });
+      await pi.emit("tool_call", {
+        toolName: "read",
+        input: { path: "src/security/SecurityConfig.java" },
+      });
+      // tool_result returns replacement content: original entries preserved
+      // plus a trailing `<instructions>` block with the matched rule.
+      const res = (await pi.emit("tool_result", {
+        toolName: "read",
+        content: [{ type: "text", text: "file body" }],
+      })) as { content?: unknown[] } | undefined;
+      expect(res?.content?.length).toBe(2);
+      const block = res?.content?.[1];
+      expect(block !== null && typeof block === "object" && "text" in block).toBe(true);
+      if (block !== null && typeof block === "object" && "text" in block) {
+        expect(String((block as { text: unknown }).text)).toContain("BE SECURE");
+      }
+      // Inject-once: a second tool_result for the same content injects nothing.
+      const res2 = await pi.emit("tool_result", {
+        toolName: "read",
+        content: [{ type: "text", text: "file body" }],
+      });
+      expect(res2).toBeUndefined();
+    });
+  });
+
   test("injects descendant AGENTS.md below session root for a touched file (no tool read)", async () => {
     await withOmp(true, async () => {
       const repo = makeRepo();

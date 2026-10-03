@@ -199,6 +199,32 @@ export default function claudeRulesForOmp(pi: ExtensionAPI): void {
     return dirs;
   }
 
+  // Render injectable sections (ancestor agents first, leaf last; rules
+  // after), caching formatted bodies per content key so the tool_result and
+  // context paths share strings and compaction re-injection reuses them.
+  function buildSections(freshAgents: AgentDoc[], freshRules: Rule[]): string {
+    const sections: string[] = [];
+    for (const a of freshAgents) {
+      const key = contentKey(a.file, a.mtimeMs);
+      let body = formattedCache.get(key);
+      if (body === undefined) {
+        body = `Contents of ${a.file}:\n\n${a.body.trim()}\n`;
+        formattedCache.set(key, body);
+      }
+      sections.push(body);
+    }
+    if (freshRules.length > 0) {
+      const key = `rules@${freshRules.map((r) => contentKey(r.file, r.mtimeMs)).join("+")}`;
+      let body = formattedCache.get(key);
+      if (body === undefined) {
+        body = formatRules(freshRules);
+        formattedCache.set(key, body);
+      }
+      sections.push(body);
+    }
+    return sections.join("\n---\n\n");
+  }
+
   pi.on("tool_call", async (event) => {
     const toolName = event.toolName;
     const name = typeof toolName === "string" ? toolName : "";
@@ -217,6 +243,50 @@ export default function claudeRulesForOmp(pi: ExtensionAPI): void {
     touched.add(norm);
     mergeAgents(discoverAgents(sessionCwd, touchedDirs()));
     log("tool_call", { name, raw: p, normalized: norm, repoRoot });
+  });
+
+  // Guaranteed-delivery injection: `tool_result` fires synchronously inside
+  // the agent tool loop (agent-session hooks) and its returned `content`
+  // REPLACES the tool result the model sees next — unlike `context`
+  // (transformContext, dead in text/headless runs per 2026-10-03 probes) and
+  // unlike `before_agent_start.message` (dropped from stored session in
+  // PROBE3). Appends matching rules + nested AGENTS.md as trailing text so
+  // the very next model step reads file content + guidance together.
+  // Inject-once per session via the shared injectedEver set (compaction clears).
+  pi.on("tool_result", async (event) => {
+    const toolName = event.toolName;
+    const name = typeof toolName === "string" ? toolName : "";
+    if (!PATH_TOOLS.has(name) && !GLOBS_TOOLS.has(name)) return;
+    const touchedList = [...touched];
+    if (touchedList.length === 0) return;
+    const freshRules = rules.filter((r) => !injectedEver.has(contentKey(r.file, r.mtimeMs)) && matchRule(r, touchedList));
+    const freshAgents = agents.filter((a) => !injectedEver.has(contentKey(a.file, a.mtimeMs)) && matchAgent(a, touchedList, repoRoot));
+    if (freshRules.length === 0 && freshAgents.length === 0) return;
+    for (const r of freshRules) injectedEver.add(contentKey(r.file, r.mtimeMs));
+    for (const a of freshAgents) injectedEver.add(contentKey(a.file, a.mtimeMs));
+    const sections: string[] = [];
+    for (const a of freshAgents) {
+      const key = contentKey(a.file, a.mtimeMs);
+      let body = formattedCache.get(key);
+      if (body === undefined) {
+        body = `Contents of ${a.file}:\n\n${a.body.trim()}\n`;
+        formattedCache.set(key, body);
+      }
+      sections.push(body);
+    }
+    if (freshRules.length > 0) {
+      const key = `rules@${freshRules.map((r) => contentKey(r.file, r.mtimeMs)).join("+")}`;
+      let body = formattedCache.get(key);
+      if (body === undefined) {
+        body = formatRules(freshRules);
+        formattedCache.set(key, body);
+      }
+      sections.push(body);
+    }
+    const block = `<instructions>\n${sections.join("\n---\n\n")}\n</instructions>`;
+    const content = Array.isArray(event.content) ? [...event.content] : [];
+    content.push({ type: "text", text: block } as never);
+    return { content };
   });
 
   // Fires once per user prompt, before the tool loop runs any tool calls.
@@ -301,26 +371,7 @@ export default function claudeRulesForOmp(pi: ExtensionAPI): void {
       if (freshRules.length === 0 && freshAgents.length === 0) return;
       for (const r of freshRules) injectedEver.add(contentKey(r.file, r.mtimeMs));
       for (const a of freshAgents) injectedEver.add(contentKey(a.file, a.mtimeMs));
-      const sections: string[] = [];
-      // Ancestors first, leaf last (agents already root → leaf); rules after.
-      for (const a of freshAgents) {
-        const key = contentKey(a.file, a.mtimeMs);
-        let body = formattedCache.get(key);
-        if (body === undefined) {
-          body = `Contents of ${a.file}:\n\n${a.body.trim()}\n`;
-          formattedCache.set(key, body);
-        }
-        sections.push(body);
-      }
-      if (freshRules.length > 0) {
-        const key = `rules@${freshRules.map((r) => contentKey(r.file, r.mtimeMs)).join("+")}`;
-        let body = formattedCache.get(key);
-        if (body === undefined) {
-          body = formatRules(freshRules);
-          formattedCache.set(key, body);
-        }
-        sections.push(body);
-      }
+      const sections = buildSections(freshAgents, freshRules);
       // UserMessage isn't exported from the public API; the injected role is a
       // user-role `<instructions>` block appended after the tool result so the
       // model reads it as the current user instruction.
@@ -329,7 +380,7 @@ export default function claudeRulesForOmp(pi: ExtensionAPI): void {
           ...event.messages,
           {
             role: "user",
-            content: `<instructions>\n${sections.join("\n---\n\n")}\n</instructions>`,
+            content: `<instructions>\n${sections}\n</instructions>`,
           } as never,
         ],
       };
